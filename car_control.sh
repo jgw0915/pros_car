@@ -1,5 +1,8 @@
 #!/bin/bash
 
+IMAGE_NAME="ghcr.io/screamlab/pros_car_docker_image:latest"
+NETWORK_NAME="compose_my_bridge_network"
+
 # 1. 統一管理 -v 參數
 VOLUME_ARGS="-v $(pwd)/src:/workspaces/src -v $(pwd)/launch:/workspaces/launch"
 
@@ -20,28 +23,71 @@ USE_GPU=false
 
 # 檢查是否為 Linux 並且支援 NVIDIA GPU
 if [ "$OS" = "Linux" ]; then
+    GPU_CANDIDATES=()
+
     if [ -f "/etc/nv_tegra_release" ]; then
-        GPU_FLAGS="--runtime=nvidia"
-        USE_GPU=true
-    elif docker info --format '{{json .}}' | grep -q '"Runtimes".*nvidia'; then
-        GPU_FLAGS="--gpus all"
-        USE_GPU=true
+        GPU_CANDIDATES+=("--runtime=nvidia")
+    else
+        DOCKER_RUNTIMES=$(docker info --format '{{json .Runtimes}}' 2>&1)
+        DOCKER_INFO_STATUS=$?
+
+        if [ $DOCKER_INFO_STATUS -ne 0 ]; then
+            echo "Could not query Docker runtimes: $DOCKER_RUNTIMES"
+        elif echo "$DOCKER_RUNTIMES" | grep -q "nvidia"; then
+            GPU_CANDIDATES+=("--gpus all")
+        fi
+
+        if command -v nvidia-smi > /dev/null 2>&1; then
+            if nvidia-smi > /dev/null 2>&1; then
+                GPU_CANDIDATES+=("--gpus all")
+            else
+                echo "Host NVIDIA driver exists, but nvidia-smi failed. Docker GPU may not work."
+            fi
+        fi
     fi
+
+    for CANDIDATE in "${GPU_CANDIDATES[@]}"; do
+        [ -z "$CANDIDATE" ] && continue
+
+        echo "Testing Docker run with GPU flags: $CANDIDATE"
+        GPU_TEST_OUTPUT=$(docker run --rm $CANDIDATE "$IMAGE_NAME" /bin/bash -c "echo GPU test" 2>&1)
+        if [ $? -eq 0 ]; then
+            GPU_FLAGS="$CANDIDATE"
+            USE_GPU=true
+            break
+        fi
+
+        echo "GPU test failed with '$CANDIDATE':"
+        echo "$GPU_TEST_OUTPUT"
+    done
 fi
 
-# 測試 GPU 是否可用
-if [ "$USE_GPU" = true ]; then
-    echo "Testing Docker run with GPU..."
-    docker run --rm $GPU_FLAGS ghcr.io/screamlab/pros_car_docker_image:latest /bin/bash -c "echo GPU test" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "GPU not supported or failed, disabling GPU flags."
-        GPU_FLAGS=""
-        USE_GPU=false
-    fi
+if [ "$USE_GPU" != true ]; then
+    echo "Docker GPU support was not detected; continuing without GPU flags."
 fi
 
 echo "Detected OS: $OS, Architecture: $ARCH"
 echo "GPU Flags: $GPU_FLAGS"
+
+if ! docker info > /dev/null 2>&1; then
+    echo "Docker is not available for this user."
+    echo "Try: sudo usermod -aG docker $USER"
+    echo "Then log out and log back in before running this script again."
+    exit 1
+fi
+
+if [ ! -f ".env" ]; then
+    echo "Missing .env in $(pwd). Run this script from the pros_car folder."
+    exit 1
+fi
+
+if ! docker network inspect "$NETWORK_NAME" > /dev/null 2>&1; then
+    echo "Docker network '$NETWORK_NAME' does not exist; creating it..."
+    if ! docker network create --driver bridge "$NETWORK_NAME" > /dev/null; then
+        echo "Failed to create Docker network '$NETWORK_NAME'."
+        exit 1
+    fi
+fi
 
 # 設定適當的 Docker 參數
 device_options=""
@@ -61,13 +107,13 @@ fi
 if [ "$ARCH" = "aarch64" ]; then
     echo "Detected architecture: arm64"
     docker run -it --rm \
-        --network compose_my_bridge_network \
+        --network "$NETWORK_NAME" \
         $PORT_MAPPING \
         $device_options \
         --runtime=nvidia \
         --env-file .env \
         -v "$(pwd)/src:/workspaces/src" \
-        ghcr.io/screamlab/pros_car_docker_image:latest \
+        "$IMAGE_NAME" \
         /bin/bash
 
 elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); then
@@ -76,36 +122,47 @@ elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); 
     if [ "$OS" = "Darwin" ]; then
         echo "Running Docker on macOS (without GPU support)..."
         docker run -it --rm \
-            --network compose_my_bridge_network \
+            --network "$NETWORK_NAME" \
             $PORT_MAPPING \
             $device_options \
             --env-file .env \
             $VOLUME_ARGS \
-            ghcr.io/screamlab/pros_car_docker_image:latest \
+            "$IMAGE_NAME" \
             /bin/bash
     else
-        echo "Trying to run with GPU support..."
+        if [ "$USE_GPU" = true ]; then
+            echo "Trying to run with GPU support..."
+        else
+            echo "Running without GPU support..."
+        fi
         docker run -it --rm \
-            --network compose_my_bridge_network \
+            --network "$NETWORK_NAME" \
             $PORT_MAPPING \
             $GPU_FLAGS \
             $device_options \
             --env-file .env \
             $VOLUME_ARGS \
-            ghcr.io/screamlab/pros_car_docker_image:latest \
+            "$IMAGE_NAME" \
             /bin/bash
 
-        # 如果 GPU 啟動失敗，回退到 CPU 模式
-        if [ $? -ne 0 ]; then
-            echo "GPU not supported or failed, falling back to CPU mode..."
-            docker run -it --rm \
-                --network compose_my_bridge_network \
-                $PORT_MAPPING \
-                --env-file .env \
-                $device_options \
-                $VOLUME_ARGS \
-                ghcr.io/screamlab/pros_car_docker_image:latest \
-                /bin/bash
+        RUN_STATUS=$?
+
+        if [ $RUN_STATUS -ne 0 ]; then
+            if [ "$USE_GPU" = true ]; then
+                echo "Docker run failed with GPU flags, falling back to CPU mode..."
+                docker run -it --rm \
+                    --network "$NETWORK_NAME" \
+                    $PORT_MAPPING \
+                    --env-file .env \
+                    $device_options \
+                    $VOLUME_ARGS \
+                    "$IMAGE_NAME" \
+                    /bin/bash
+            else
+                echo "Docker run failed without GPU flags. This is probably not a GPU detection problem."
+                echo "Check Docker permissions, .env, and image availability."
+                exit $RUN_STATUS
+            fi
         fi
     fi
 else

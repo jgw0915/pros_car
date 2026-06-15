@@ -30,6 +30,7 @@ setup(
             "arm_test = pros_car_py.arm_test:main",
             "lidar_trans = pros_car_py.lidar_trans:main",
             "task_mission = pros_car_py.task_mission_controller:main",
+            "simple_task_mission = pros_car_py.simple_task_mission_controller:main",
         ],
     },
 )

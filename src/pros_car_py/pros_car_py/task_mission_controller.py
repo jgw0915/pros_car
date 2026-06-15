@@ -65,6 +65,26 @@ def distance_2d(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+BRIDGE_ENTRY_SUPPRESSED_FIELDS = (
+    "entry_u",
+    "entry_v",
+    "entry_confidence",
+    "entry_depth",
+    "entry_from_road_connection",
+    "entry_gate_left_u",
+    "entry_gate_right_u",
+    "entry_gate_center_u",
+    "entry_gate_v",
+    "entry_gate_width_pixels",
+    "pre_entry_u",
+    "pre_entry_v",
+    "pre_entry_confidence",
+    "pre_entry_depth",
+    "entry_confirmed",
+    "entry_gate_confirmed",
+)
+
+
 class MissionLogger:
     """Small adapter so pure controllers can emit consistent mission events."""
 
@@ -173,15 +193,49 @@ class AscentController:
 
     @staticmethod
     def action(node, bridge):
+        anchor = BridgeBearAnchor.info(node)
+        if BridgeBearAnchor.valid_for_ascent(node, anchor):
+            action = BridgeBearAnchor.action(
+                node, node.task2_ascent_action, phase="ascent", info=anchor
+            )
+            node._log_event(
+                "info",
+                "ascent_bear_anchor_control",
+                chosen_action=action,
+                **node._bear_anchor_log_fields(anchor),
+            )
+            return action
         if not node.task2_ascent_centering_enabled or bridge is None:
+            node._log_event("info", "ascent_ramp_control", chosen_action=node.task2_ascent_action)
             return node.task2_ascent_action
         delta = BridgeVisionAnalyzer.ramp_delta(node, bridge)
         if delta is None:
+            node._log_event("info", "ascent_ramp_control", chosen_action=node.task2_ascent_action)
             return node.task2_ascent_action
         if abs(delta) > node.task2_bridge_approach_hard_tolerance:
-            return node._turn_action_from_error(delta)
+            action = node._turn_action_from_error(delta)
+            node._log_event(
+                "info",
+                "ascent_ramp_control",
+                chosen_action=action,
+                ramp_delta=delta,
+            )
+            return action
         if abs(delta) > node.task2_bridge_approach_soft_tolerance:
-            return "RIGHT_FRONT" if delta > 0.0 else "LEFT_FRONT"
+            action = "RIGHT_FRONT" if delta > 0.0 else "LEFT_FRONT"
+            node._log_event(
+                "info",
+                "ascent_ramp_control",
+                chosen_action=action,
+                ramp_delta=delta,
+            )
+            return action
+        node._log_event(
+            "info",
+            "ascent_ramp_control",
+            chosen_action=node.task2_ascent_action,
+            ramp_delta=delta,
+        )
         return node.task2_ascent_action
 
 
@@ -203,11 +257,12 @@ class BridgeBearMemory:
         self.bbox = dict(node.yolo_bbox) if node.yolo_bbox is not None else None
         self.target_info = dict(node.yolo_target) if node.yolo_target is not None else None
         self.surface_info = (
-            dict(node.target_surface_info)
-            if node.target_surface_info is not None
+            dict(getattr(node, "target_surface_info", None))
+            if getattr(node, "target_surface_info", None) is not None
             else None
         )
-        self.seen_state = node.state.value if hasattr(node.state, "value") else str(node.state)
+        state = getattr(node, "state", "")
+        self.seen_state = state.value if hasattr(state, "value") else str(state)
         self.confidence = float(confidence)
 
     def recent(self, node, ttl_seconds, min_confidence):
@@ -221,6 +276,46 @@ class BridgeBearMemory:
         if self.valid and self.last_seen_time is not None:
             if node._elapsed_seconds(self.last_seen_time) > ttl_seconds:
                 self.valid = False
+
+
+class BridgeBearAnchor:
+    """Bear-on-bridge visual anchor used for alignment before it becomes a target."""
+
+    @staticmethod
+    def info(node, update_memory=True):
+        return node._bear_anchor_info(update_memory=update_memory)
+
+    @staticmethod
+    def valid_for_pre_ascent(node, info=None):
+        if info is None:
+            info = BridgeBearAnchor.info(node)
+        return bool(info.get("valid_for_pre_ascent", False))
+
+    @staticmethod
+    def valid_for_ascent(node, info=None):
+        if info is None:
+            info = BridgeBearAnchor.info(node)
+        return bool(info.get("valid_for_ascent", False))
+
+    @staticmethod
+    def action(node, base_action, phase="ascent", info=None):
+        if not node.task2_use_bear_anchor_for_ascent:
+            return base_action
+        if info is None:
+            info = BridgeBearAnchor.info(node)
+        if not info.get("visible", False):
+            return base_action
+        if phase == "pre_ascent" and not info.get("pre_ascent_y_ok", False):
+            return base_action
+        if phase == "ascent" and not info.get("valid_for_ascent", False):
+            return base_action
+
+        error = float(info.get("center_error_x", 0.0))
+        if abs(error) <= node.task2_bear_anchor_center_tolerance_pixels:
+            return base_action
+        if phase == "ascent" and abs(error) <= node.task2_bear_anchor_center_tolerance_pixels * 2.0:
+            return "RIGHT_FRONT" if error > 0.0 else "LEFT_FRONT"
+        return node._turn_action_from_error(error)
 
 
 class Task1MissionController(Node):
@@ -406,6 +501,11 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_turn_wrong_way_limit", 2)
         self.declare_parameter("task2_turn_direction_sign", 1.0)
         self.declare_parameter("task2_turn_auto_flip_enabled", True)
+        self.declare_parameter("task2_turn_centered_no_entry_timeout_seconds", 1.2)
+        self.declare_parameter("task2_turn_allow_near_ramp_fallback", True)
+        self.declare_parameter("task2_turn_near_ramp_min_confidence", 0.48)
+        self.declare_parameter("task2_turn_near_ramp_min_vertical_coverage", 0.38)
+        self.declare_parameter("task2_turn_no_entry_forward_pulse_seconds", 0.4)
         self.declare_parameter("task2_approach_min_seconds", 1.0)
         self.declare_parameter("task2_entry_close_confirm_frames", 5)
         self.declare_parameter("task2_entry_close_max_range_m", 0.90)
@@ -415,7 +515,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_final_align_loss_timeout_seconds", 1.5)
         self.declare_parameter("task2_final_align_close_hysteresis_seconds", 0.8)
         self.declare_parameter("task2_final_align_confirm_frames", 6)
-        self.declare_parameter("bridge_map_projection_enabled", True)
+        self.declare_parameter("bridge_map_projection_enabled", False)
         self.declare_parameter("bridge_map_tf_timeout_seconds", 0.20)
         self.declare_parameter("bridge_map_max_tf_age_seconds", 0.50)
         self.declare_parameter("bridge_landmark_min_observations", 3)
@@ -490,11 +590,32 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_ramp_entry_min_bottom_y_ratio", 0.70)
         self.declare_parameter("task2_ramp_entry_min_vertical_coverage", 0.45)
         self.declare_parameter("task2_ramp_entry_max_side_view_score", 0.45)
+        self.declare_parameter("task2_use_bear_anchor_for_ascent", True)
+        self.declare_parameter("task2_bear_anchor_min_confidence", 0.45)
+        self.declare_parameter("task2_bear_anchor_max_age_seconds", 0.6)
+        self.declare_parameter("task2_bear_anchor_pre_ascent_min_center_y_ratio", 0.08)
+        self.declare_parameter("task2_bear_anchor_pre_ascent_max_center_y_ratio", 0.45)
+        self.declare_parameter("task2_bear_anchor_pre_ascent_min_center_x_ratio", 0.35)
+        self.declare_parameter("task2_bear_anchor_pre_ascent_max_center_x_ratio", 0.65)
+        self.declare_parameter("task2_bear_anchor_ascent_min_center_x_ratio", 0.30)
+        self.declare_parameter("task2_bear_anchor_ascent_max_center_x_ratio", 0.70)
+        self.declare_parameter("task2_bear_anchor_center_tolerance_pixels", 45.0)
+        self.declare_parameter("task2_bear_anchor_require_near_bridge_before_top", True)
+        self.declare_parameter("task2_bear_anchor_memory_ttl_seconds", 10.0)
+        self.declare_parameter("task2_bear_anchor_min_y_progress_ratio", 0.12)
+        self.declare_parameter("task2_bear_anchor_depth_progress_min_m", 0.20)
+        self.declare_parameter("task2_bear_anchor_progress_confirm_frames", 3)
         self.declare_parameter("task2_top_use_tf_z", True)
         self.declare_parameter("task2_top_z_threshold_m", 0.18)
         self.declare_parameter("task2_top_min_ascent_seconds", 7.0)
         self.declare_parameter("task2_top_confirm_frames", 5)
         self.declare_parameter("task2_top_visual_confidence_threshold", 0.55)
+        self.declare_parameter("task2_top_use_bear_depth", True)
+        self.declare_parameter("task2_top_bear_depth_threshold_m", 0.37)
+        self.declare_parameter("task2_top_bear_depth_confirm_frames", 3)
+        self.declare_parameter("task2_top_bear_depth_max_center_error_pixels", 80.0)
+        self.declare_parameter("task2_top_require_stable_stop_before_approach", True)
+        self.declare_parameter("task2_top_platform_settle_seconds", 0.8)
         self.declare_parameter("task2_bridge_bear_memory_ttl_seconds", 12.0)
         self.declare_parameter("task2_bridge_bear_memory_min_confidence", 0.45)
         self.declare_parameter("task2_relax_bridge_surface_after_top", True)
@@ -504,6 +625,10 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_top_search_use_cached_bear_direction", True)
         self.declare_parameter("task2_top_search_allow_short_recenter", True)
         self.declare_parameter("task2_top_search_short_recenter_seconds", 0.3)
+        self.declare_parameter("task2_bridge_bear_approach_max_depth_m", 0.60)
+        self.declare_parameter("task2_bridge_bear_observe_depth_m", 0.37)
+        self.declare_parameter("task2_bridge_bear_grab_depth_m", 0.37)
+        self.declare_parameter("task2_bridge_bear_reacquire_if_depth_above_m", 0.85)
         self.declare_parameter("control_period_seconds", 0.1)
         self.declare_parameter("exploration_grid_spacing", 1.2)
         self.declare_parameter("exploration_clearance", 0.35)
@@ -1034,6 +1159,21 @@ class Task1MissionController(Node):
         self.task2_turn_auto_flip_enabled = self._bool_param(
             "task2_turn_auto_flip_enabled"
         )
+        self.task2_turn_centered_no_entry_timeout = self._double_param(
+            "task2_turn_centered_no_entry_timeout_seconds"
+        )
+        self.task2_turn_allow_near_ramp_fallback = self._bool_param(
+            "task2_turn_allow_near_ramp_fallback"
+        )
+        self.task2_turn_near_ramp_min_confidence = self._double_param(
+            "task2_turn_near_ramp_min_confidence"
+        )
+        self.task2_turn_near_ramp_min_vertical_coverage = self._double_param(
+            "task2_turn_near_ramp_min_vertical_coverage"
+        )
+        self.task2_turn_no_entry_forward_pulse_seconds = self._double_param(
+            "task2_turn_no_entry_forward_pulse_seconds"
+        )
         self.task2_approach_min_seconds = self._double_param(
             "task2_approach_min_seconds"
         )
@@ -1268,6 +1408,51 @@ class Task1MissionController(Node):
         self.task2_ramp_entry_max_side_view_score = self._double_param(
             "task2_ramp_entry_max_side_view_score"
         )
+        self.task2_use_bear_anchor_for_ascent = self._bool_param(
+            "task2_use_bear_anchor_for_ascent"
+        )
+        self.task2_bear_anchor_min_confidence = self._double_param(
+            "task2_bear_anchor_min_confidence"
+        )
+        self.task2_bear_anchor_max_age_seconds = self._double_param(
+            "task2_bear_anchor_max_age_seconds"
+        )
+        self.task2_bear_anchor_pre_ascent_min_center_y_ratio = self._double_param(
+            "task2_bear_anchor_pre_ascent_min_center_y_ratio"
+        )
+        self.task2_bear_anchor_pre_ascent_max_center_y_ratio = self._double_param(
+            "task2_bear_anchor_pre_ascent_max_center_y_ratio"
+        )
+        self.task2_bear_anchor_pre_ascent_min_center_x_ratio = self._double_param(
+            "task2_bear_anchor_pre_ascent_min_center_x_ratio"
+        )
+        self.task2_bear_anchor_pre_ascent_max_center_x_ratio = self._double_param(
+            "task2_bear_anchor_pre_ascent_max_center_x_ratio"
+        )
+        self.task2_bear_anchor_ascent_min_center_x_ratio = self._double_param(
+            "task2_bear_anchor_ascent_min_center_x_ratio"
+        )
+        self.task2_bear_anchor_ascent_max_center_x_ratio = self._double_param(
+            "task2_bear_anchor_ascent_max_center_x_ratio"
+        )
+        self.task2_bear_anchor_center_tolerance_pixels = self._double_param(
+            "task2_bear_anchor_center_tolerance_pixels"
+        )
+        self.task2_bear_anchor_require_near_bridge_before_top = self._bool_param(
+            "task2_bear_anchor_require_near_bridge_before_top"
+        )
+        self.task2_bear_anchor_memory_ttl_seconds = self._double_param(
+            "task2_bear_anchor_memory_ttl_seconds"
+        )
+        self.task2_bear_anchor_min_y_progress_ratio = self._double_param(
+            "task2_bear_anchor_min_y_progress_ratio"
+        )
+        self.task2_bear_anchor_depth_progress_min_m = self._double_param(
+            "task2_bear_anchor_depth_progress_min_m"
+        )
+        self.task2_bear_anchor_progress_confirm_frames = self._integer_param(
+            "task2_bear_anchor_progress_confirm_frames"
+        )
         self.task2_top_use_tf_z = self._bool_param("task2_top_use_tf_z")
         self.task2_top_z_threshold = self._double_param("task2_top_z_threshold_m")
         self.task2_top_min_ascent_seconds = self._double_param(
@@ -1278,6 +1463,22 @@ class Task1MissionController(Node):
         )
         self.task2_top_visual_confidence_threshold = self._double_param(
             "task2_top_visual_confidence_threshold"
+        )
+        self.task2_top_use_bear_depth = self._bool_param("task2_top_use_bear_depth")
+        self.task2_top_bear_depth_threshold = self._double_param(
+            "task2_top_bear_depth_threshold_m"
+        )
+        self.task2_top_bear_depth_confirm_frames = self._integer_param(
+            "task2_top_bear_depth_confirm_frames"
+        )
+        self.task2_top_bear_depth_max_center_error_pixels = self._double_param(
+            "task2_top_bear_depth_max_center_error_pixels"
+        )
+        self.task2_top_require_stable_stop_before_approach = self._bool_param(
+            "task2_top_require_stable_stop_before_approach"
+        )
+        self.task2_top_platform_settle_seconds = self._double_param(
+            "task2_top_platform_settle_seconds"
         )
         self.task2_bridge_bear_memory_ttl_seconds = self._double_param(
             "task2_bridge_bear_memory_ttl_seconds"
@@ -1305,6 +1506,18 @@ class Task1MissionController(Node):
         )
         self.task2_top_search_short_recenter_seconds = self._double_param(
             "task2_top_search_short_recenter_seconds"
+        )
+        self.task2_bridge_bear_approach_max_depth = self._double_param(
+            "task2_bridge_bear_approach_max_depth_m"
+        )
+        self.task2_bridge_bear_observe_depth = self._double_param(
+            "task2_bridge_bear_observe_depth_m"
+        )
+        self.task2_bridge_bear_grab_depth = self._double_param(
+            "task2_bridge_bear_grab_depth_m"
+        )
+        self.task2_bridge_bear_reacquire_if_depth_above = self._double_param(
+            "task2_bridge_bear_reacquire_if_depth_above_m"
         )
         self.exploration_grid_spacing = self._double_param("exploration_grid_spacing")
         self.exploration_clearance = self._double_param("exploration_clearance")
@@ -1549,6 +1762,7 @@ class Task1MissionController(Node):
         self.task2_turn_command_direction = 1.0
         self.task2_turn_wrong_way_count = 0
         self.task2_turn_centered_frames = 0
+        self.task2_turn_centered_no_entry_start_time = None
         self.task2_turn_last_observed_error = None
         self.task2_turn_sign_confirmed = False
         self.task2_entry_close_confirm_count = 0
@@ -1570,6 +1784,17 @@ class Task1MissionController(Node):
         self.bridge_top_confirm_count = 0
         self.bridge_top_confidence_reason = "not evaluated"
         self.bridge_top_visual_confidence = 0.0
+        self.task2_top_bear_depth_confirm_count = 0
+        self.task2_top_confirmed_time = None
+        self.task2_bear_anchor_first_y_ratio = None
+        self.task2_bear_anchor_last_y_ratio = None
+        self.task2_bear_anchor_first_depth = None
+        self.task2_bear_anchor_best_depth = None
+        self.task2_bear_anchor_last_seen_time = None
+        self.task2_bear_anchor_progress_start_time = None
+        self.task2_bear_anchor_progress_confirm_count = 0
+        self.task2_bear_anchor_last_info = None
+        self.task2_bear_anchor_last_memory_log_time = None
         self.bridge_bear_memory = BridgeBearMemory()
         self.mission_logger = MissionLogger(self)
         self.target_surface_confirm_start_time = None
@@ -1873,8 +2098,27 @@ class Task1MissionController(Node):
         pose = self.pose if getattr(self, "pose", None) is not None else (None, None, None)
         bridge = getattr(self, "bridge_landmark", {})
         target = getattr(self, "yolo_target", None) or {}
+        bbox = getattr(self, "yolo_bbox", None) or {}
         target_surface = getattr(self, "target_surface_info", None) or {}
         connection = self._bridge_connection() if hasattr(self, "segmentation_connection") else None
+        ramp_fields = self._bridge_ramp_log_fields() if hasattr(self, "_bridge_ramp_log_fields") else {}
+        anchor_info = (
+            BridgeBearAnchor.info(self, update_memory=False)
+            if hasattr(self, "task2_use_bear_anchor_for_ascent")
+            else {}
+        )
+        anchor_fields = (
+            self._bear_anchor_log_fields(anchor_info)
+            if hasattr(self, "_bear_anchor_log_fields")
+            else {}
+        )
+        bear_depth_ok, bear_depth_reason = (
+            self._bear_depth_top_platform_ok(update_count=False)
+            if hasattr(self, "_bear_depth_top_platform_ok")
+            else (False, "")
+        )
+        start_z = getattr(self, "start_pose_z", None)
+        pose_z = getattr(self, "pose_z", 0.0)
         record = {
             "timestamp": now.nanoseconds / 1e9,
             "run_id": getattr(self, "mission_run_id", ""),
@@ -1885,6 +2129,9 @@ class Task1MissionController(Node):
             "pose_x": pose[0],
             "pose_y": pose[1],
             "pose_yaw": pose[2],
+            "pose_z": pose_z,
+            "start_pose_z": start_z,
+            "z_delta": None if start_z is None else pose_z - float(start_z),
             "bridge_raw": self._current_bridge_raw_visible(),
             "bridge_fresh_age": self._bridge_fresh_age() if hasattr(self, "bridge_landmark") else None,
             "bridge_cached": bridge.get("source_is_cached"),
@@ -1900,16 +2147,24 @@ class Task1MissionController(Node):
             "bridge_corridor_width": self._current_bridge_corridor_width(),
             "target_visible": bool(target.get("found", False)),
             "target_distance": target.get("distance"),
+            "bbox_center_x": bbox.get("center_x"),
+            "bbox_center_y": bbox.get("center_y"),
             "target_on_bridge": bool(
                 target_surface.get("target_bottom_center_on_bridge", False)
                 or target_surface.get("target_center_on_bridge", False)
             ),
+            "bear_depth_top_ok": bear_depth_ok,
+            "top_platform_confidence": getattr(self, "bridge_top_confirmed", False),
+            "top_platform_reason": getattr(self, "bridge_top_confidence_reason", ""),
+            "top_platform_bear_depth_reason": bear_depth_reason,
             "virtual_obstacle_count": len(getattr(self, "virtual_obstacles", [])),
             "augmented_map_obstacle_cell_count": getattr(
                 self, "last_augmented_map_obstacle_cell_count", 0
             ),
             "state_transition_reason": fields.get("reason", ""),
         }
+        record.update(ramp_fields)
+        record.update(anchor_fields)
         record.update(fields)
         return record
 
@@ -2487,6 +2742,18 @@ class Task1MissionController(Node):
             merged.append(point)
         return merged[-max_count:]
 
+    def _sanitize_bridge_entry_fields(self, label, result, segment):
+        if label != "bridge":
+            result["invalid_entry_suppressed"] = False
+            return result
+
+        entry_confirmed = float(segment.get("entry_confirmed", 0.0)) >= 0.5
+        result["invalid_entry_suppressed"] = not entry_confirmed
+        if not entry_confirmed:
+            for field in BRIDGE_ENTRY_SUPPRESSED_FIELDS:
+                result[field] = 0.0
+        return result
+
     def _filtered_segment_update(self, label, segment, now):
         prev = None if self.segmentation_info is None else self.segmentation_info.get(label)
         alpha = min(1.0, max(0.0, self.segmentation_smoothing_alpha))
@@ -2501,10 +2768,14 @@ class Task1MissionController(Node):
             retained["usable"] = False
             retained["predicted_or_cached"] = True
             retained["last_update_time"] = now
+            if label == "bridge":
+                for field in BRIDGE_ENTRY_SUPPRESSED_FIELDS:
+                    retained[field] = 0.0
+                retained["invalid_entry_suppressed"] = True
             return retained
 
         if prev is None:
-            return {
+            result = {
                 "found": found,
                 "raw_found": found,
                 "usable": found,
@@ -2559,6 +2830,7 @@ class Task1MissionController(Node):
                 "vertical_coverage_score": float(segment.get("vertical_coverage_score", 0.0)),
                 "ramp_reason_code": float(segment.get("ramp_reason_code", 0.0)),
             }
+            return self._sanitize_bridge_entry_fields(label, result, segment)
 
         # Keep filtered values continuous to avoid steering jitter from segmentation flicker.
         delta_x = (1.0 - alpha) * float(prev["delta_x"]) + alpha * float(segment["delta_x"])
@@ -2668,7 +2940,7 @@ class Task1MissionController(Node):
         vertical_coverage_score = (1.0 - alpha) * float(
             prev.get("vertical_coverage_score", 0.0)
         ) + alpha * float(segment.get("vertical_coverage_score", 0.0))
-        return {
+        result = {
             "found": found,
             "raw_found": found,
             "usable": found,
@@ -2719,6 +2991,7 @@ class Task1MissionController(Node):
             "vertical_coverage_score": vertical_coverage_score,
             "ramp_reason_code": float(segment.get("ramp_reason_code", 0.0)),
         }
+        return self._sanitize_bridge_entry_fields(label, result, segment)
 
     def _control_loop(self):
         self._publish_startup_arm_stow_if_needed()
@@ -3084,6 +3357,11 @@ class Task1MissionController(Node):
         self._publish_action("CLOCKWISE_ROTATION_SLOW")
 
     def _approach_bear(self):
+        if self.bear_context == "task2_bridge_bear":
+            guard_action = self._task2_bridge_bear_approach_guard()
+            if guard_action == "handled":
+                return
+
         if not self._mission_target_visible():
             self._publish_action("CLOCKWISE_ROTATION_SLOW")
             return
@@ -3113,6 +3391,55 @@ class Task1MissionController(Node):
             return
 
         self._publish_action("FORWARD_SLOW")
+
+    def _task2_bridge_bear_approach_guard(self):
+        if not self._task2_top_recently_confirmed():
+            self._publish_action("STOP")
+            self.get_logger().warn(
+                "Task 2 bridge-bear approach requested before confirmed top; reacquiring."
+            )
+            self._set_state(
+                MissionState.TASK2_SEARCH_BRIDGE_BEAR,
+                reason="bridge top not confirmed for bear approach",
+            )
+            return "handled"
+        if not self._target_visible():
+            return None
+        distance = float(self.yolo_target.get("distance", 0.0))
+        if distance <= 0.0:
+            self._publish_action("STOP")
+            return "handled"
+        if distance >= self.task2_bridge_bear_reacquire_if_depth_above:
+            self._publish_action("STOP")
+            self.get_logger().warn(
+                "Task 2 bridge-bear depth grew too large; returning to top search."
+            )
+            self._set_state(
+                MissionState.TASK2_SEARCH_BRIDGE_BEAR,
+                reason="bridge bear depth above reacquire threshold",
+            )
+            return "handled"
+        if distance <= self.task2_bridge_bear_grab_depth:
+            self._publish_action("STOP")
+            self._reset_observation()
+            self.grab_approach_start_time = None
+            self._set_state(MissionState.APPROACH_GRAB)
+            return "handled"
+        if distance <= self.task2_bridge_bear_observe_depth:
+            lower_ok, lower_reason = self._target_bbox_in_lower_camera()
+            self._publish_action("STOP")
+            if lower_ok:
+                self.observe_start_time = self.get_clock().now()
+                self.observe_start_pose = self.pose
+                self.last_observed_target_time = self.observe_start_time
+                self.last_observed_target_distance = distance
+                self._set_state(MissionState.OBSERVE_BEAR)
+            else:
+                self._log_lower_bbox_gate("bridge-bear observe", lower_reason)
+            return "handled"
+        if distance > self.task2_bridge_bear_approach_max_depth:
+            return None
+        return None
 
     def _observe_bear(self):
         self._publish_action("STOP")
@@ -3401,6 +3728,9 @@ class Task1MissionController(Node):
         self.task2_ascent_start_z = None
         self.bridge_top_confirmed = False
         self.bridge_top_confirm_count = 0
+        self.task2_top_bear_depth_confirm_count = 0
+        self.task2_top_confirmed_time = None
+        self._reset_task2_bear_anchor_tracking()
         self.bridge_bear_memory = BridgeBearMemory()
         self._clear_navigation()
         self.get_logger().info("Starting Task 2 after Task 1 completion.")
@@ -3548,10 +3878,34 @@ class Task1MissionController(Node):
         return BridgeVisionAnalyzer.side_view_likely(self, bridge)
 
     def _task2_entry_source(self, bridge=None, update_ramp_confirm=True):
+        detail = self._task2_entry_source_detailed(
+            bridge, update_ramp_confirm=update_ramp_confirm
+        )
+        return detail["source"] if detail["accepted"] else "none"
+
+    def _task2_entry_source_detailed(self, bridge=None, update_ramp_confirm=True):
         if bridge is None:
             bridge = self._task2_bridge_visible(allow_cached=False)
+        ramp_confidence = float(bridge.get("ramp_confidence", 0.0)) if bridge else 0.0
+        side_view_score = float(bridge.get("side_view_score", 1.0)) if bridge else 1.0
+        detail = {
+            "source": "none",
+            "accepted": False,
+            "reason": "no fresh bridge observation",
+            "ramp_confidence": ramp_confidence,
+            "side_view_score": side_view_score,
+            "entry_confirmed": False,
+            "confirm_count": self.task2_ramp_entry_confirm_count,
+        }
+        if bridge is None or not self._bridge_observation_is_fresh(bridge):
+            if update_ramp_confirm:
+                self.task2_ramp_entry_confirm_count = 0
+            return detail
+
+        entry_confirmed = self._task2_bridge_entry_confirmed(bridge)
+        detail["entry_confirmed"] = entry_confirmed
         source = BridgeVisionAnalyzer.entry_source(self, bridge)
-        if source == "road_contact":
+        if entry_confirmed:
             delta = self._task2_bridge_entry_delta(bridge)
             if (
                 self._task2_bridge_pre_entry_confirmed(bridge)
@@ -3559,20 +3913,75 @@ class Task1MissionController(Node):
                 and abs(delta) <= self.task2_bridge_approach_hard_tolerance
             ):
                 self.task2_ramp_entry_confirm_count = 0
-                return source
-            source = "ramp_fallback" if self._bridge_ramp_is_usable(bridge) else "none"
-        if source == "ramp_fallback":
+                detail.update(
+                    {
+                        "source": "road_contact",
+                        "accepted": True,
+                        "reason": "confirmed road-contact entry",
+                        "confirm_count": 0,
+                    }
+                )
+                return detail
+            if not self._bridge_ramp_is_usable(bridge):
+                if update_ramp_confirm:
+                    self.task2_ramp_entry_confirm_count = 0
+                detail["reason"] = "road-contact entry lacks usable pre-entry staging"
+                detail["confirm_count"] = self.task2_ramp_entry_confirm_count
+                return detail
+            source = "ramp_fallback"
+        elif source != "ramp_fallback" and self._task2_near_ramp_fallback_usable(bridge):
+            source = "near_ramp_fallback"
+
+        if source in ("ramp_fallback", "near_ramp_fallback"):
             if update_ramp_confirm:
                 self.task2_ramp_entry_confirm_count += 1
-            if (
+            accepted = (
                 self.task2_ramp_entry_confirm_count
                 >= self.task2_ramp_entry_confirm_frames
-            ):
-                return source
-            return "none"
+            )
+            detail.update(
+                {
+                    "source": source,
+                    "accepted": accepted,
+                    "reason": (
+                        "ramp fallback confirmed"
+                        if accepted
+                        else "ramp fallback waiting for confirm frames"
+                    ),
+                    "confirm_count": self.task2_ramp_entry_confirm_count,
+                }
+            )
+            return detail
+
         if update_ramp_confirm:
             self.task2_ramp_entry_confirm_count = 0
-        return "none"
+        detail["reason"] = "no road-contact, ramp-fallback, or near-ramp entry source"
+        detail["confirm_count"] = self.task2_ramp_entry_confirm_count
+        return detail
+
+    def _task2_near_ramp_fallback_usable(self, bridge=None):
+        if bridge is None:
+            bridge = self._task2_bridge_visible(allow_cached=False)
+        if bridge is None or not self.task2_turn_allow_near_ramp_fallback:
+            return False
+        if not self._bridge_observation_is_fresh(bridge):
+            return False
+        if float(bridge.get("ramp_lower_present", 0.0)) < 0.5:
+            return False
+        if (
+            float(bridge.get("ramp_confidence", 0.0))
+            < self.task2_turn_near_ramp_min_confidence
+        ):
+            return False
+        if (
+            float(bridge.get("vertical_coverage_score", 0.0))
+            < self.task2_turn_near_ramp_min_vertical_coverage
+        ):
+            return False
+        if float(bridge.get("side_view_score", 1.0)) > self.task2_ramp_entry_max_side_view_score:
+            return False
+        delta = BridgeVisionAnalyzer.ramp_delta(self, bridge)
+        return delta is not None and abs(delta) <= self.task2_bridge_approach_hard_tolerance
 
     def _task2_entry_delta(self, bridge=None):
         if bridge is None:
@@ -3580,7 +3989,7 @@ class Task1MissionController(Node):
         source = self._task2_entry_source(bridge, update_ramp_confirm=False)
         if source == "road_contact":
             return self._task2_bridge_pre_entry_delta(bridge) or self._task2_bridge_entry_delta(bridge)
-        if source == "ramp_fallback":
+        if source in ("ramp_fallback", "near_ramp_fallback"):
             return BridgeVisionAnalyzer.ramp_delta(self, bridge)
         return BridgeVisionAnalyzer.ramp_delta(self, bridge)
 
@@ -3775,21 +4184,29 @@ class Task1MissionController(Node):
             self._task2_evaluate_turn_pulse(delta_x)
             if abs(delta_x) <= self.task2_turn_visual_deadband_pixels:
                 self.task2_turn_centered_frames += 1
-                self._publish_action("STOP")
+                entry_detail = self._task2_entry_source_detailed(bridge)
                 if (
                     self.task2_turn_centered_frames
                     >= self.task2_turn_center_confirm_frames
                     and self._elapsed_seconds(self.task2_turn_state_start_time)
                     >= self.task2_turn_min_state_seconds
-                    and self._task2_entry_source(bridge) != "none"
+                    and entry_detail["accepted"]
                 ):
                     self.get_logger().info(
                         "Task 2: bridge turn centered with fresh frames; approaching entry."
                     )
                     self._reset_bridge_turn_controller()
                     self._set_state(MissionState.TASK2_APPROACH_BRIDGE_ENTRY)
+                    return
+
+                action = self._task2_turn_centered_no_entry_recovery_action(
+                    bridge, entry_detail
+                )
+                if action is not None:
+                    self._publish_action(action)
                 return
             self.task2_turn_centered_frames = 0
+            self.task2_turn_centered_no_entry_start_time = None
             action = self._task2_turn_pulse_action(delta_x)
             self._publish_action(action)
             return
@@ -3837,6 +4254,70 @@ class Task1MissionController(Node):
         )
         self._reset_bridge_turn_controller()
         self._set_state(MissionState.TASK2_SEARCH_BRIDGE)
+
+    def _task2_turn_centered_no_entry_recovery_action(self, bridge, entry_detail):
+        now = self.get_clock().now()
+        if self.task2_turn_centered_no_entry_start_time is None:
+            self.task2_turn_centered_no_entry_start_time = now
+
+        elapsed = self._elapsed_seconds(self.task2_turn_centered_no_entry_start_time)
+        chosen_action = "STOP"
+        recovery_reason = entry_detail.get("reason", "centered but no entry source")
+
+        if self._bridge_side_view_likely(bridge):
+            self._log_event(
+                "warn",
+                "turn_centered_no_entry_recovery",
+                chosen_action="TASK2_SIDE_VIEW_RECOVERY",
+                recovery_reason="side-view bridge while centered",
+                **self._bridge_ramp_log_fields(bridge),
+            )
+            self._reset_bridge_turn_controller()
+            self._set_state(
+                MissionState.TASK2_SIDE_VIEW_RECOVERY,
+                reason="centered side-view bridge without entry",
+            )
+            return None
+
+        if elapsed >= self.task2_turn_centered_no_entry_timeout:
+            self._log_event(
+                "warn",
+                "turn_centered_no_entry_recovery",
+                chosen_action="TASK2_EXPLORE_FOR_BRIDGE",
+                recovery_reason="centered no-entry timeout",
+                **self._bridge_ramp_log_fields(bridge),
+            )
+            self._reset_bridge_turn_controller()
+            self._set_state(
+                MissionState.TASK2_EXPLORE_FOR_BRIDGE,
+                reason="centered no-entry timeout",
+            )
+            return None
+
+        lower_present = bool(bridge and float(bridge.get("ramp_lower_present", 0.0)) >= 0.5)
+        near_ramp = self._task2_near_ramp_fallback_usable(bridge)
+        if (near_ramp or lower_present) and elapsed <= self.task2_turn_no_entry_forward_pulse_seconds:
+            chosen_action = "FORWARD_SLOW"
+            recovery_reason = (
+                "near-ramp forward viewpoint pulse"
+                if near_ramp
+                else "lower ramp present forward viewpoint pulse"
+            )
+        else:
+            road_action = self._task2_road_explore_action()
+            chosen_action = road_action if road_action != "STOP" else self._task2_scan_action()
+            recovery_reason = "road-follow viewpoint improvement"
+
+        self._log_event(
+            "warn",
+            "turn_centered_no_entry_recovery",
+            chosen_action=chosen_action,
+            recovery_reason=recovery_reason,
+            entry_detail_source=entry_detail.get("source"),
+            entry_accepted=entry_detail.get("accepted"),
+            **self._bridge_ramp_log_fields(bridge),
+        )
+        return chosen_action
 
     def _task2_side_view_recovery(self):
         if self.task2_side_view_recovery_start_time is None:
@@ -3952,6 +4433,7 @@ class Task1MissionController(Node):
         self.task2_turn_error_before_pulse = None
         self.task2_turn_command_action = None
         self.task2_turn_centered_frames = 0
+        self.task2_turn_centered_no_entry_start_time = None
 
     def _task2_approach_bridge_entry(self):
         if self.task2_phase_start_time is None:
@@ -4030,6 +4512,7 @@ class Task1MissionController(Node):
 
         fresh = self._bridge_observation_is_fresh(bridge)
         if bridge is not None and fresh:
+            entry_detail = self._task2_entry_source_detailed(bridge)
             entry_confirmed = self._task2_bridge_entry_confirmed(bridge)
             pre_entry_confirmed = self._task2_bridge_pre_entry_confirmed(bridge)
             delta_x = None
@@ -4072,7 +4555,10 @@ class Task1MissionController(Node):
                 return self._task2_entry_blocked_recovery_action(safety, bridge)
 
             if not entry_confirmed:
-                if self._bridge_ramp_is_usable(bridge):
+                if entry_detail["accepted"] and entry_detail["source"] in (
+                    "ramp_fallback",
+                    "near_ramp_fallback",
+                ):
                     safety = self._action_safety_check(
                         "FORWARD_SLOW", context="task2_bridge_entry", bridge=bridge
                     )
@@ -4243,6 +4729,331 @@ class Task1MissionController(Node):
                     nearest_side = side
         return nearest_side
 
+    def _reset_task2_bear_anchor_tracking(self):
+        self.task2_bear_anchor_first_y_ratio = None
+        self.task2_bear_anchor_last_y_ratio = None
+        self.task2_bear_anchor_first_depth = None
+        self.task2_bear_anchor_best_depth = None
+        self.task2_bear_anchor_last_seen_time = None
+        self.task2_bear_anchor_progress_start_time = None
+        self.task2_bear_anchor_progress_confirm_count = 0
+        self.task2_bear_anchor_last_info = None
+        self.task2_bear_anchor_last_memory_log_time = None
+
+    def _bear_anchor_info(self, update_memory=True):
+        empty = {
+            "visible": False,
+            "fresh": False,
+            "valid_for_pre_ascent": False,
+            "valid_for_ascent": False,
+            "pre_ascent_y_ok": False,
+            "on_or_near_bridge_surface": False,
+            "confidence": 0.0,
+            "depth": 0.0,
+            "bbox_center_x_ratio": 0.0,
+            "bbox_center_y_ratio": 0.0,
+            "bbox_bottom_y_ratio": 0.0,
+            "center_error_x": 0.0,
+            "center_error_y": 0.0,
+            "last_seen_age": 999.0,
+            "vertical_progress": 0.0,
+            "vertical_progress_confirmed": False,
+            "reason": "no fresh target bbox",
+        }
+        yolo_target = getattr(self, "yolo_target", None)
+        yolo_bbox = getattr(self, "yolo_bbox", None)
+        yolo_target_stamp = getattr(self, "yolo_target_stamp", None)
+        yolo_bbox_stamp = getattr(self, "yolo_bbox_stamp", None)
+        if yolo_target is None or yolo_bbox is None:
+            return empty
+        if not yolo_target.get("found", False) or not yolo_bbox.get("found", False):
+            return empty
+        if yolo_target_stamp is None or yolo_bbox_stamp is None:
+            return empty
+
+        max_age = max(0.05, self.task2_bear_anchor_max_age_seconds)
+        target_age = self._elapsed_seconds(yolo_target_stamp)
+        bbox_age = self._elapsed_seconds(yolo_bbox_stamp)
+        if target_age > max_age or bbox_age > max_age:
+            empty["last_seen_age"] = min(target_age, bbox_age)
+            empty["reason"] = "target or bbox is stale"
+            return empty
+
+        bbox = yolo_bbox
+        image_width = max(1.0, float(bbox.get("image_width", 0.0)))
+        image_height = max(1.0, float(bbox.get("image_height", 0.0)))
+        center_x = float(bbox.get("center_x", 0.0))
+        center_y = float(bbox.get("center_y", 0.0))
+        bottom_y = float(bbox.get("y2", center_y))
+        confidence = float(bbox.get("confidence", 0.0))
+        depth = float(bbox.get("distance", yolo_target.get("distance", 0.0)))
+        if depth <= 0.0:
+            depth = float(yolo_target.get("distance", 0.0))
+        center_x_ratio = center_x / image_width
+        center_y_ratio = center_y / image_height
+        bottom_y_ratio = bottom_y / image_height
+        center_error_x = center_x - image_width * 0.5
+        center_error_y = center_y - image_height * 0.5
+
+        target_surface_info = getattr(self, "target_surface_info", None)
+        target_surface_stamp = getattr(self, "target_surface_stamp", None)
+        surface_available = (
+            target_surface_info is not None
+            and target_surface_stamp is not None
+            and self._elapsed_seconds(target_surface_stamp) <= self.target_timeout
+        )
+        surface_candidate, _ = self._target_surface_candidate() if surface_available else (False, "")
+        on_or_near_bridge = (
+            surface_candidate
+            or getattr(self, "bridge_top_confirmed", False)
+            or not surface_available
+        )
+        bridge_context_ok = (
+            on_or_near_bridge
+            or not self.task2_bear_anchor_require_near_bridge_before_top
+        )
+
+        pre_y_ok = (
+            self.task2_bear_anchor_pre_ascent_min_center_y_ratio
+            <= center_y_ratio
+            <= self.task2_bear_anchor_pre_ascent_max_center_y_ratio
+        )
+        pre_x_ok = (
+            self.task2_bear_anchor_pre_ascent_min_center_x_ratio
+            <= center_x_ratio
+            <= self.task2_bear_anchor_pre_ascent_max_center_x_ratio
+        )
+        ascent_x_ok = (
+            self.task2_bear_anchor_ascent_min_center_x_ratio
+            <= center_x_ratio
+            <= self.task2_bear_anchor_ascent_max_center_x_ratio
+        )
+        confidence_ok = confidence >= self.task2_bear_anchor_min_confidence
+
+        info = {
+            "visible": True,
+            "fresh": True,
+            "valid_for_pre_ascent": bool(confidence_ok and bridge_context_ok and pre_y_ok and pre_x_ok),
+            "valid_for_ascent": bool(confidence_ok and bridge_context_ok and ascent_x_ok),
+            "pre_ascent_y_ok": bool(confidence_ok and bridge_context_ok and pre_y_ok),
+            "on_or_near_bridge_surface": bool(on_or_near_bridge),
+            "confidence": confidence,
+            "depth": depth,
+            "bbox_center_x_ratio": center_x_ratio,
+            "bbox_center_y_ratio": center_y_ratio,
+            "bbox_bottom_y_ratio": bottom_y_ratio,
+            "center_error_x": center_error_x,
+            "center_error_y": center_error_y,
+            "last_seen_age": max(target_age, bbox_age),
+            "vertical_progress": 0.0,
+            "vertical_progress_confirmed": False,
+            "reason": "bear anchor visible",
+        }
+
+        if update_memory:
+            now = self.get_clock().now()
+            previously_seen = self.task2_bear_anchor_last_seen_time
+            self._update_bear_anchor_tracking(info, now)
+            if (
+                previously_seen is None
+                or self._elapsed_seconds(previously_seen) >= 1.0
+            ):
+                self._log_event(
+                    "info",
+                    "bear_anchor_seen",
+                    **self._bear_anchor_log_fields(info),
+                )
+        progress_ok, progress, progress_reason = self._bear_anchor_vertical_progress(
+            info, update_count=update_memory
+        )
+        info["vertical_progress"] = progress
+        info["vertical_progress_confirmed"] = progress_ok
+        info["vertical_progress_reason"] = progress_reason
+        self.task2_bear_anchor_last_info = dict(info)
+        return info
+
+    def _update_bear_anchor_tracking(self, info, now):
+        y_ratio = float(info.get("bbox_center_y_ratio", 0.0))
+        depth = float(info.get("depth", 0.0))
+        if self.task2_bear_anchor_first_y_ratio is None:
+            self.task2_bear_anchor_first_y_ratio = y_ratio
+            self.task2_bear_anchor_progress_start_time = now
+        self.task2_bear_anchor_last_y_ratio = y_ratio
+        if depth > 0.0:
+            if self.task2_bear_anchor_first_depth is None:
+                self.task2_bear_anchor_first_depth = depth
+            if self.task2_bear_anchor_best_depth is None:
+                self.task2_bear_anchor_best_depth = depth
+            else:
+                self.task2_bear_anchor_best_depth = min(
+                    self.task2_bear_anchor_best_depth, depth
+                )
+        self.task2_bear_anchor_last_seen_time = now
+        self.bridge_bear_memory.clear_if_expired(
+            self, self.task2_bear_anchor_memory_ttl_seconds
+        )
+        self.bridge_bear_memory.update(self, float(info.get("confidence", 0.0)))
+        if (
+            self.task2_bear_anchor_last_memory_log_time is None
+            or self._elapsed_seconds(self.task2_bear_anchor_last_memory_log_time) >= 1.0
+        ):
+            self.task2_bear_anchor_last_memory_log_time = now
+            self._log_event(
+                "info",
+                "bear_anchor_memory_updated",
+                **self._bear_anchor_log_fields(info),
+            )
+
+    def _bear_anchor_vertical_progress(self, info=None, update_count=False):
+        if info is None:
+            info = self.task2_bear_anchor_last_info or {}
+        if not info.get("visible", False):
+            if update_count:
+                self.task2_bear_anchor_progress_confirm_count = 0
+            return False, 0.0, "bear anchor not visible"
+
+        first_y = self.task2_bear_anchor_first_y_ratio
+        current_y = float(info.get("bbox_center_y_ratio", 0.0))
+        y_progress = 0.0 if first_y is None else current_y - float(first_y)
+        depth = float(info.get("depth", 0.0))
+        first_depth = self.task2_bear_anchor_first_depth
+        depth_progress = 0.0
+        if first_depth is not None and depth > 0.0:
+            depth_progress = float(first_depth) - depth
+        depth_top = (
+            self.task2_top_use_bear_depth
+            and 0.0 < depth <= self.task2_top_bear_depth_threshold
+        )
+        raw_ok = (
+            y_progress >= self.task2_bear_anchor_min_y_progress_ratio
+            or depth_progress >= self.task2_bear_anchor_depth_progress_min_m
+            or depth_top
+        )
+        if update_count:
+            if raw_ok:
+                self.task2_bear_anchor_progress_confirm_count += 1
+            else:
+                self.task2_bear_anchor_progress_confirm_count = 0
+        confirmed = (
+            self.task2_bear_anchor_progress_confirm_count
+            >= self.task2_bear_anchor_progress_confirm_frames
+        )
+        if depth_top:
+            reason = "bear depth reached top threshold"
+        elif depth_progress >= self.task2_bear_anchor_depth_progress_min_m:
+            reason = f"bear depth decreased {depth_progress:.2f}m"
+        elif y_progress >= self.task2_bear_anchor_min_y_progress_ratio:
+            reason = f"bear moved downward {y_progress:.2f}"
+        else:
+            reason = "bear vertical progress waiting"
+        return confirmed, max(y_progress, depth_progress, 0.0), reason
+
+    def _bear_depth_top_platform_ok(self, update_count=True):
+        if not self.task2_top_use_bear_depth:
+            return False, "bear-depth top disabled"
+        info = BridgeBearAnchor.info(self, update_memory=False)
+        if not info.get("visible", False):
+            if update_count:
+                self.task2_top_bear_depth_confirm_count = 0
+            return False, "bear anchor not visible for top-depth check"
+        depth = float(info.get("depth", 0.0))
+        if depth <= 0.0:
+            if update_count:
+                self.task2_top_bear_depth_confirm_count = 0
+            return False, "bear depth invalid"
+        if depth > self.task2_top_bear_depth_threshold:
+            if update_count:
+                self.task2_top_bear_depth_confirm_count = 0
+            return False, f"bear depth {depth:.2f}m above top threshold"
+        if abs(float(info.get("center_error_x", 0.0))) > self.task2_top_bear_depth_max_center_error_pixels:
+            if update_count:
+                self.task2_top_bear_depth_confirm_count = 0
+            return False, "bear is not centered enough for top-depth check"
+        if update_count:
+            self.task2_top_bear_depth_confirm_count += 1
+        confirmed = (
+            self.task2_top_bear_depth_confirm_count
+            >= self.task2_top_bear_depth_confirm_frames
+        )
+        return confirmed, f"bear depth {depth:.2f}m confirms bridge top"
+
+    def _task2_top_recently_confirmed(self):
+        if self.bridge_top_confirmed:
+            return True
+        if self.task2_top_confirmed_time is None:
+            return False
+        return self._elapsed_seconds(self.task2_top_confirmed_time) <= max(
+            1.0, self.task2_top_platform_settle_seconds + 2.0
+        )
+
+    def _bridge_ramp_log_fields(self, bridge=None):
+        if bridge is None:
+            bridge = self._task2_bridge_visible(allow_cached=True)
+        entry_detail = (
+            self._task2_entry_source_detailed(bridge, update_ramp_confirm=False)
+            if bridge is not None
+            else {
+                "source": "none",
+                "accepted": False,
+                "reason": "no bridge",
+                "ramp_confidence": 0.0,
+                "side_view_score": 0.0,
+                "entry_confirmed": False,
+            }
+        )
+        return {
+            "ramp_valid": bool(bridge and float(bridge.get("ramp_valid", 0.0)) >= 0.5),
+            "ramp_confidence": float(bridge.get("ramp_confidence", 0.0)) if bridge else 0.0,
+            "ramp_lower_present": bool(bridge and float(bridge.get("ramp_lower_present", 0.0)) >= 0.5),
+            "ramp_continuous": bool(bridge and float(bridge.get("ramp_continuous", 0.0)) >= 0.5),
+            "side_view_score": float(bridge.get("side_view_score", 0.0)) if bridge else 0.0,
+            "vertical_coverage_score": float(bridge.get("vertical_coverage_score", 0.0)) if bridge else 0.0,
+            "ramp_reason_code": float(bridge.get("ramp_reason_code", 0.0)) if bridge else 0.0,
+            "entry_source": entry_detail.get("source", "none"),
+            "entry_confirmed": bool(entry_detail.get("entry_confirmed", False)),
+            "entry_confidence": float(bridge.get("entry_confidence", 0.0)) if bridge else 0.0,
+            "target_confidence": float(bridge.get("target_confidence", 0.0)) if bridge else 0.0,
+            "invalid_entry_suppressed": bool(bridge and bridge.get("invalid_entry_suppressed", False)),
+        }
+
+    def _bear_anchor_log_fields(self, info=None):
+        if info is None:
+            info = self.task2_bear_anchor_last_info or BridgeBearAnchor.info(
+                self, update_memory=False
+            )
+        return {
+            "bbox_center_x": (
+                None
+                if self.yolo_bbox is None
+                else self.yolo_bbox.get("center_x")
+            ),
+            "bbox_center_y": (
+                None
+                if self.yolo_bbox is None
+                else self.yolo_bbox.get("center_y")
+            ),
+            "bbox_center_x_ratio": info.get("bbox_center_x_ratio", 0.0),
+            "bbox_center_y_ratio": info.get("bbox_center_y_ratio", 0.0),
+            "bbox_bottom_y_ratio": info.get("bbox_bottom_y_ratio", 0.0),
+            "bear_anchor_visible": bool(info.get("visible", False)),
+            "bear_anchor_valid": bool(
+                info.get("valid_for_pre_ascent", False)
+                or info.get("valid_for_ascent", False)
+            ),
+            "bear_anchor_depth": info.get("depth", 0.0),
+            "bear_anchor_depth_ok": (
+                0.0
+                < float(info.get("depth", 0.0))
+                <= getattr(self, "task2_top_bear_depth_threshold", 0.37)
+            ),
+            "bear_anchor_center_error_x": info.get("center_error_x", 0.0),
+            "bear_anchor_vertical_progress": info.get("vertical_progress", 0.0),
+            "bear_anchor_last_seen_age": info.get("last_seen_age", 999.0),
+            "bridge_bear_memory_valid": getattr(
+                getattr(self, "bridge_bear_memory", None), "valid", False
+            ),
+        }
+
     def _task2_final_align_bridge(self):
         bridge = self._task2_bridge_visible(allow_cached=True)
         self._update_bridge_bear_memory()
@@ -4289,12 +5100,14 @@ class Task1MissionController(Node):
             self._publish_action("STOP")
             return
 
-        entry_source = self._task2_entry_source(bridge)
+        entry_detail = self._task2_entry_source_detailed(bridge)
+        entry_source = entry_detail["source"] if entry_detail["accepted"] else "none"
         if entry_source == "none":
             self._task2_reset_bridge_confirm()
             self._publish_action("STOP")
             self.get_logger().info(
-                "Task 2: final alignment waiting for road-contact or ramp-fallback entry."
+                "Task 2: final alignment waiting for road-contact or ramp-fallback entry "
+                f"({entry_detail['reason']})."
             )
             return
 
@@ -4309,6 +5122,21 @@ class Task1MissionController(Node):
             return
 
         if abs(delta_x) <= self.task2_bridge_entry_final_tolerance:
+            anchor = BridgeBearAnchor.info(self)
+            anchor_action = BridgeBearAnchor.action(
+                self, "STOP", phase="pre_ascent", info=anchor
+            )
+            if anchor.get("visible", False) and anchor_action != "STOP":
+                self.task2_final_align_confirm_count = 0
+                self._log_event(
+                    "info",
+                    "bear_anchor_used_for_alignment",
+                    bear_anchor_phase="pre_ascent",
+                    chosen_action=anchor_action,
+                    **self._bear_anchor_log_fields(anchor),
+                )
+                self._publish_action(anchor_action)
+                return
             self.task2_final_align_confirm_count += 1
             self._publish_action("STOP")
             if self.task2_final_align_confirm_count >= self.task2_final_align_confirm_frames:
@@ -4347,18 +5175,26 @@ class Task1MissionController(Node):
             self.task2_ascent_start_z = self.pose_z
             self.bridge_top_confirm_count = 0
             self.bridge_top_confirmed = False
+            self.task2_top_bear_depth_confirm_count = 0
+            self._reset_task2_bear_anchor_tracking()
             self.get_logger().info(
                 "Task 2 ascent: strong ramp climb with top-confidence gating."
             )
 
         if self.task2_ascent_stop_start_time is not None:
             self._publish_action("STOP")
+            settle_seconds = (
+                self.task2_top_platform_settle_seconds
+                if self.task2_top_require_stable_stop_before_approach
+                else self.task2_ascent_stop_settle_seconds
+            )
             if (
                 self._elapsed_seconds(self.task2_ascent_stop_start_time)
-                >= self.task2_ascent_stop_settle_seconds
+                >= settle_seconds
             ):
                 self.task2_ascent_completed = True
                 self.bridge_top_confirmed = True
+                self.task2_top_confirmed_time = self.get_clock().now()
                 self.task2_phase_start_time = None
                 self.task2_ascent_stop_start_time = None
                 self._log_event("info", "task2_ascent_completed")
@@ -4409,15 +5245,17 @@ class Task1MissionController(Node):
             else:
                 self._log_event(
                     "info",
-                    "task2_ascent_top_gate",
+                    "ascent_top_confirmed",
                     top_confidence=top_ok,
                     top_score=top_score,
                     reason=top_reason,
                     elapsed=elapsed,
                     pose_z=self.pose_z,
                     start_pose_z=self.start_pose_z or 0.0,
+                    **self._bear_anchor_log_fields(),
                 )
                 self.bridge_top_confirmed = True
+                self.task2_top_confirmed_time = self.get_clock().now()
                 self._start_task2_ascent_settle()
                 return
 
@@ -4442,8 +5280,16 @@ class Task1MissionController(Node):
         self._publish_action("STOP")
         if self.task2_ascent_stop_start_time is None:
             self.task2_ascent_stop_start_time = self.get_clock().now()
+            self.bridge_top_confirmed = True
+            self.task2_top_confirmed_time = self.task2_ascent_stop_start_time
             self.get_logger().info(
                 "Task 2 ascent complete; stopping before bridge-top bear search."
+            )
+            self._log_event(
+                "info",
+                "ascent_settle",
+                settle_seconds=self.task2_top_platform_settle_seconds,
+                reason=self.bridge_top_confidence_reason,
             )
 
     def _publish_ascent_or_action(self, action_key):
@@ -4503,17 +5349,41 @@ class Task1MissionController(Node):
         if self.task2_top_use_tf_z and z_delta >= self.task2_top_z_threshold:
             return True, 1.0, f"z threshold reached ({z_delta:.2f}m)"
 
+        bear_depth_ok, bear_depth_reason = self._bear_depth_top_platform_ok(
+            update_count=True
+        )
+        if bear_depth_ok:
+            self._log_event(
+                "info",
+                "top_platform_confirmed_by_bear_depth",
+                z_delta=z_delta,
+                **self._bear_anchor_log_fields(),
+            )
+            return True, 1.0, bear_depth_reason
+
         visual_score = self._bridge_top_visual_score()
+        progress_ok, progress, progress_reason = self._bear_anchor_vertical_progress(
+            update_count=False
+        )
+        if progress_ok:
+            visual_score = min(1.0, visual_score + 0.18)
         if (
             elapsed >= self.task2_top_min_ascent_seconds
             and visual_score >= self.task2_top_visual_confidence_threshold
         ):
-            return True, visual_score, "visual top confidence reached"
+            return True, visual_score, (
+                "visual top confidence reached"
+                if not progress_ok
+                else f"visual top confidence with bear progress: {progress_reason}"
+            )
 
         if elapsed >= self.task2_ascent_timeout + max(0.0, self.task2_ascent_max_extra_seconds):
             return True, max(visual_score, 0.55), "max ascent time reached"
 
-        return False, visual_score, f"top confidence waiting (z_delta={z_delta:.2f}m)"
+        return False, visual_score, (
+            f"top confidence waiting (z_delta={z_delta:.2f}m, "
+            f"bear_depth={bear_depth_reason}, progress={progress:.2f})"
+        )
 
     def _bridge_top_visual_score(self):
         bridge = self._task2_bridge_visible(allow_cached=False)
@@ -6067,7 +6937,12 @@ class Task1MissionController(Node):
             return False, "no fresh target bbox"
 
         distance = float(self.yolo_target.get("distance", 0.0))
-        if not (0.0 < distance <= self.grab_distance):
+        grab_distance = (
+            self.task2_bridge_bear_grab_depth
+            if self.bear_context == "task2_bridge_bear"
+            else self.grab_distance
+        )
+        if not (0.0 < distance <= grab_distance):
             return False, f"target distance {distance:.2f} outside grab range"
 
         bbox = self.yolo_bbox
@@ -7045,11 +7920,25 @@ class Task1MissionController(Node):
             or self._elapsed_seconds(self.last_bridge_debug_log_time) >= 1.0
         ):
             self.last_bridge_debug_log_time = now
+            bridge = self._task2_bridge_visible(allow_cached=True)
+            ramp_fields = self._bridge_ramp_log_fields(bridge)
+            anchor_info = BridgeBearAnchor.info(self, update_memory=False)
+            anchor_fields = self._bear_anchor_log_fields(anchor_info)
+            bear_depth_ok, bear_depth_reason = self._bear_depth_top_platform_ok(
+                update_count=False
+            )
             text = (
                 f"bridge_valid={self.bridge_landmark.get('valid', False)} "
                 f"conf={self.bridge_landmark.get('confidence', 0.0):.2f} "
                 f"obs={self.bridge_landmark.get('observation_count', 0)} "
                 f"fresh_age={self._bridge_fresh_age():.2f}s "
+                f"entry_source={ramp_fields['entry_source']} "
+                f"entry_confirmed={ramp_fields['entry_confirmed']} "
+                f"invalid_entry_suppressed={ramp_fields['invalid_entry_suppressed']} "
+                f"ramp_valid={ramp_fields['ramp_valid']} "
+                f"ramp_confidence={ramp_fields['ramp_confidence']:.2f} "
+                f"side_view_score={ramp_fields['side_view_score']:.2f} "
+                f"vertical_coverage={ramp_fields['vertical_coverage_score']:.2f} "
                 f"entry=({self.bridge_landmark.get('entry_map_x')},"
                 f"{self.bridge_landmark.get('entry_map_y')}) "
                 f"turn_sign={self.task2_turn_direction_sign:+.0f} "
@@ -7058,9 +7947,17 @@ class Task1MissionController(Node):
                 f"pose_z={self.pose_z:.3f} "
                 f"top_confidence={self.bridge_top_confirmed} "
                 f"top_frames={self.bridge_top_confirm_count} "
+                f"bear_depth_top_ok={bear_depth_ok} "
+                f"top_reason={self.bridge_top_confidence_reason} "
+                f"bear_anchor_visible={anchor_fields['bear_anchor_visible']} "
+                f"bear_anchor_valid={anchor_fields['bear_anchor_valid']} "
+                f"bear_anchor_depth={anchor_fields['bear_anchor_depth']:.2f} "
+                f"bear_anchor_dx={anchor_fields['bear_anchor_center_error_x']:.0f} "
+                f"bear_anchor_progress={anchor_fields['bear_anchor_vertical_progress']:.2f} "
                 f"bear_memory={self.bridge_bear_memory.valid} "
                 f"virtual_obstacle_shape={self.virtual_obstacle_shape} "
-                f"bridge_side_line_cells={self.bridge_side_line_cells}"
+                f"bridge_side_line_cells={self.bridge_side_line_cells} "
+                f"bear_depth_reason={bear_depth_reason}"
             )
             msg = String()
             msg.data = text
@@ -7070,6 +7967,10 @@ class Task1MissionController(Node):
                 bridge_confidence=self.bridge_landmark.get("confidence", 0.0),
                 committed_side_points=self._committed_bridge_side_point_count(),
                 augmented_map_obstacle_cells=self.last_augmented_map_obstacle_cell_count,
+                **ramp_fields,
+                **anchor_fields,
+                bear_depth_top_ok=bear_depth_ok,
+                top_platform_reason=self.bridge_top_confidence_reason,
             )
 
         if (
@@ -7099,6 +8000,10 @@ class Task1MissionController(Node):
 
         bridge = self._task2_bridge_visible(allow_cached=True)
         entry_source = self._task2_entry_source(bridge, update_ramp_confirm=False)
+        ramp_fields = self._bridge_ramp_log_fields(bridge)
+        anchor_info = BridgeBearAnchor.info(self, update_memory=False)
+        anchor_fields = self._bear_anchor_log_fields(anchor_info)
+        bear_depth_ok, _ = self._bear_depth_top_platform_ok(update_count=False)
         ramp_valid = bool(bridge and float(bridge.get("ramp_valid", 0.0)) >= 0.5)
         ramp_confidence = float(bridge.get("ramp_confidence", 0.0)) if bridge else 0.0
         side_view_score = float(bridge.get("side_view_score", 0.0)) if bridge else 0.0
@@ -7132,11 +8037,19 @@ class Task1MissionController(Node):
             f"side_view_score={side_view_score:.2f} "
             f"ramp_continuous={ramp_continuous} "
             f"entry_source={entry_source} "
+            f"entry_confirmed={ramp_fields['entry_confirmed']} "
+            f"invalid_entry_suppressed={ramp_fields['invalid_entry_suppressed']} "
+            f"vertical_coverage_score={ramp_fields['vertical_coverage_score']:.2f} "
             f"pose_z={self.pose_z:.3f} "
             f"start_pose_z={(self.start_pose_z or 0.0):.3f} "
             f"top_confidence={self.bridge_top_confirmed} "
             f"top_confirm_frames={self.bridge_top_confirm_count} "
             f"top_reason={self.bridge_top_confidence_reason} "
+            f"bear_depth_top_ok={bear_depth_ok} "
+            f"bear_anchor_visible={anchor_fields['bear_anchor_visible']} "
+            f"bear_anchor_depth={anchor_fields['bear_anchor_depth']:.2f} "
+            f"bear_anchor_dx={anchor_fields['bear_anchor_center_error_x']:.0f} "
+            f"bear_anchor_progress={anchor_fields['bear_anchor_vertical_progress']:.2f} "
             f"bridge_bear_memory_valid={self.bridge_bear_memory.valid} "
             f"marker_reason={marker_reason} "
             f"augmented_map_reason={self.augmented_map_visible_reason}"

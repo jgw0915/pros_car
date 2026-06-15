@@ -281,6 +281,20 @@ def _bridge_node():
     node.task2_top_visual_confidence_threshold = 0.55
     node.task2_ascent_timeout = 14.0
     node.task2_ascent_max_extra_seconds = 4.0
+    node.task2_ascent_forward_speed_scale = 1.25
+    node.task2_ascent_bear_pid_enabled = True
+    node.task2_ascent_bear_pid_center_tolerance_pixels = 35.0
+    node.task2_ascent_bear_pid_kp = 2.0
+    node.task2_ascent_bear_pid_ki = 0.0
+    node.task2_ascent_bear_pid_kd = 0.10
+    node.task2_ascent_bear_pid_integral_limit = 200.0
+    node.task2_ascent_bear_pid_max_turn = 340.0
+    node.task2_ascent_bear_pid_rotate_only_pixels = 150.0
+    node.task2_ascent_bear_pid_forward_scale = 0.75
+    node.task2_ascent_stop_on_bridge_loss_seconds = 0.35
+    node.task2_ascent_bear_pid_integral = 0.0
+    node.task2_ascent_bear_pid_last_error = None
+    node.task2_ascent_bear_pid_last_time = None
     node.virtual_obstacle_shape = "line"
     node.virtual_obstacle_line_length = 0.35
     node.virtual_obstacle_line_width = 0.08
@@ -351,8 +365,14 @@ def _bridge_node():
         "_task2_bridge_bear_delta_for_ascent",
         "_task2_bridge_bear_turn_action",
         "_task2_bridge_bear_ascent_action",
+        "_reset_task2_ascent_bear_pid",
         "_task2_frontal_bridge_base_ready_for_ascent",
         "_task2_frontal_bridge_ready_for_ascent",
+        "_task2_ascend_bridge",
+        "_start_task2_ascent_settle",
+        "_publish_ascent_or_action",
+        "_publish_ascent_bear_pid",
+        "_publish_ascent_forward",
         "_bridge_top_confidence",
         "_bridge_top_visual_score",
         "_make_marker",
@@ -1203,6 +1223,109 @@ def test_top_confidence_false_at_min_time_without_z_or_visual_signal():
     ok, _, _ = Task1MissionController._bridge_top_confidence(node)
 
     assert not ok
+
+
+def test_ascent_bear_pid_action_selected_when_bridge_bear_off_center():
+    node = _bridge_node()
+    node._target_visible = lambda: True
+    node.yolo_target = {"delta_x": 90.0}
+    node.target_surface_stamp = types.SimpleNamespace(nanoseconds=1_000_000_000)
+    node.target_surface_info = {
+        "target_found": True,
+        "bridge_found": True,
+        "target_side_bridge_contact": True,
+        "target_side_bridge_contact_ratio": 0.08,
+        "bbox_bridge_overlap_ratio": 0.0,
+        "bbox_lower_half_bridge_overlap_ratio": 0.0,
+    }
+
+    action = Task1MissionController._task2_bridge_bear_ascent_action(node)
+
+    assert action == "ASCEND_BEAR_PID"
+
+
+def test_ascent_bear_pid_turns_right_for_positive_bear_error():
+    node = _bridge_node()
+    node._target_visible = lambda: True
+    node.yolo_target = {"delta_x": 90.0}
+    node.target_surface_stamp = types.SimpleNamespace(nanoseconds=1_000_000_000)
+    node.target_surface_info = {
+        "target_found": True,
+        "bridge_found": True,
+        "target_side_bridge_contact": True,
+        "target_side_bridge_contact_ratio": 0.08,
+        "bbox_bridge_overlap_ratio": 0.0,
+        "bbox_lower_half_bridge_overlap_ratio": 0.0,
+    }
+    node.rear_pub = DummyPublisher()
+    node.front_pub = DummyPublisher()
+    node.get_clock = lambda: DummyClock()
+    node._apply_stuck_recovery = lambda action: action
+    node.last_logged_action = None
+    node.last_action_log_time = None
+    node._log_event = lambda *args, **kwargs: None
+
+    Task1MissionController._publish_ascent_bear_pid(node)
+
+    rear = node.rear_pub.messages[-1].data
+    front = node.front_pub.messages[-1].data
+    assert rear[0] > rear[1]
+    assert front[0] > front[1]
+
+
+def test_ascent_does_not_complete_from_top_confidence_while_bridge_mask_visible():
+    node = _bridge_node()
+    node.task2_phase_start_time = types.SimpleNamespace(nanoseconds=1_000_000_000)
+    node.task2_ascent_stop_start_time = None
+    node.task2_ascent_lost_bridge_start_time = None
+    node.task2_ascent_action = "ASCEND_FORWARD"
+    node.task2_ascent_centering_enabled = False
+    node.task2_use_bridge_top_pose = False
+    node.pose_z = 0.30
+    node.start_pose_z = 0.0
+    node.task2_ascent_start_z = 0.0
+    node.bridge_top_confirm_count = 0
+    node.bridge_top_confirmed = False
+    node._update_bridge_bear_memory = lambda: None
+    node._task2_bridge_visible = lambda allow_cached=False: {
+        "raw_found": True,
+        "ramp_confidence": 0.8,
+        "bottom_y_ratio": 0.95,
+        "side_view_score": 0.1,
+        "bottom_center_x": 320.0,
+        "mid_center_x": 320.0,
+    }
+    actions = []
+    node._publish_ascent_or_action = actions.append
+
+    Task1MissionController._task2_ascend_bridge(node)
+
+    assert actions == ["ASCEND_FORWARD"]
+    assert node.task2_ascent_stop_start_time is None
+
+
+def test_ascent_completes_when_bridge_mask_lost_for_grace_period():
+    node = _bridge_node()
+    node.task2_phase_start_time = types.SimpleNamespace(nanoseconds=1_000_000_000)
+    node.task2_ascent_stop_start_time = None
+    node.task2_ascent_lost_bridge_start_time = types.SimpleNamespace(
+        nanoseconds=1_000_000_000
+    )
+    node.pose_z = 0.0
+    node.start_pose_z = 0.0
+    node.task2_ascent_start_z = 0.0
+    node.bridge_top_confirmed = False
+    node._update_bridge_bear_memory = lambda: None
+    node._task2_bridge_visible = lambda allow_cached=False: None
+    node._elapsed_seconds = lambda start_time: 0.4
+    actions = []
+    node._publish_action = actions.append
+    node._start_task2_ascent_settle = lambda: setattr(node, "settled", True)
+
+    Task1MissionController._task2_ascend_bridge(node)
+
+    assert actions == ["STOP"]
+    assert node.settled
 
 
 def test_top_confidence_true_when_z_threshold_passed():

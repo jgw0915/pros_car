@@ -265,13 +265,23 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_use_bridge_exit_pose", False)
         self.declare_parameter("task2_bridge_exit_pose", [0.0, 0.0, 0.0])
         self.declare_parameter("task2_ascent_min_seconds", 8.0)
-        self.declare_parameter("task2_ascent_timeout_seconds", 14.0)
+        self.declare_parameter("task2_ascent_timeout_seconds", 20.0)
         self.declare_parameter("task2_ascent_action", "ASCEND_FORWARD")
         self.declare_parameter("task2_ascent_forward_speed_scale", 1.25)
         self.declare_parameter("task2_ascent_require_top_confidence", True)
         self.declare_parameter("task2_ascent_continue_if_not_top", True)
         self.declare_parameter("task2_ascent_max_extra_seconds", 4.0)
         self.declare_parameter("task2_ascent_centering_enabled", True)
+        self.declare_parameter("task2_ascent_stop_on_bridge_loss_seconds", 10.0) #*
+        self.declare_parameter("task2_ascent_bear_pid_enabled", True)
+        self.declare_parameter("task2_ascent_bear_pid_center_tolerance_pixels", 105.0)
+        self.declare_parameter("task2_ascent_bear_pid_kp", 1.5)
+        self.declare_parameter("task2_ascent_bear_pid_ki", 0.0)
+        self.declare_parameter("task2_ascent_bear_pid_kd", 0.05)
+        self.declare_parameter("task2_ascent_bear_pid_integral_limit", 200.0)
+        self.declare_parameter("task2_ascent_bear_pid_max_turn", 340.0)
+        self.declare_parameter("task2_ascent_bear_pid_rotate_only_pixels", 150.0)
+        self.declare_parameter("task2_ascent_bear_pid_forward_scale", 0.75)
         self.declare_parameter("task2_descent_min_seconds", 6.0)
         self.declare_parameter("task2_descent_timeout_seconds", 10.0)
         self.declare_parameter("task2_bridge_search_timeout_seconds", 120.0)
@@ -279,7 +289,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_bridge_min_area_ratio", 0.008)
         self.declare_parameter("task2_bridge_entry_bottom_coverage", 0.04)
         self.declare_parameter("task2_bridge_center_tolerance", 90.0)
-        self.declare_parameter("task2_bridge_candidate_min_bottom_y_ratio", 0.48)
+        self.declare_parameter("task2_bridge_candidate_min_bottom_y_ratio", 0.55) #*
         self.declare_parameter("task2_bridge_entry_center_tolerance", 35.0)
         self.declare_parameter("task2_bridge_entry_lateral_tolerance", 45.0)
         self.declare_parameter("task2_bridge_entry_progress_epsilon", 0.03)
@@ -297,7 +307,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_bridge_entry_max_recovery_cycles", 4)
         self.declare_parameter("task2_bridge_detect_min_area_ratio", 0.006)
         self.declare_parameter("task2_bridge_turn_tolerance", 70.0)
-        self.declare_parameter("task2_bridge_turn_confirm_seconds", 0.3)
+        self.declare_parameter("task2_bridge_turn_confirm_seconds", 2.0) #*
         self.declare_parameter("task2_bridge_approach_soft_tolerance", 45.0)
         self.declare_parameter("task2_bridge_approach_hard_tolerance", 100.0)
         self.declare_parameter("task2_bridge_entry_bottom_coverage_close", 0.12)
@@ -314,7 +324,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_bridge_orbit_enabled", True)
         self.declare_parameter("task2_bridge_orbit_side_keep_pixels", 130.0)
         self.declare_parameter("task2_bridge_orbit_forward_seconds", 1.2)
-        self.declare_parameter("task2_bridge_orbit_turn_seconds", 0.6)
+        self.declare_parameter("task2_bridge_orbit_turn_seconds", 2.0) #*
         self.declare_parameter("task2_bridge_orbit_max_cycles", 5)
         self.declare_parameter("task2_bridge_lost_grace_seconds", 0.6)
         self.declare_parameter("task2_bridge_tracking_loss_grace_seconds", 1.2)
@@ -329,12 +339,12 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_scan_complete_radians", 6.0)
         self.declare_parameter("task2_scan_min_seconds", 3.0)
         self.declare_parameter("task2_scan_timeout_seconds", 15.0)
-        self.declare_parameter("task2_bridge_detection_confirm_seconds", 0.35)
+        self.declare_parameter("task2_bridge_detection_confirm_seconds", 0.4) #*
         self.declare_parameter("task2_road_explore_min_area_ratio", 0.015)
         self.declare_parameter("task2_road_explore_min_bottom_coverage", 0.08)
         self.declare_parameter("task2_road_explore_min_width_ratio", 0.20)
         self.declare_parameter("task2_road_explore_center_tolerance", 45.0)
-        self.declare_parameter("task2_road_explore_hard_tolerance", 100.0)
+        self.declare_parameter("task2_road_explore_hard_tolerance", 105.0)
         self.declare_parameter("task2_road_explore_segment_seconds", 4.0)
         self.declare_parameter("task2_road_reacquire_timeout_seconds", 5.0)
         self.declare_parameter("task2_explore_goal_min_translation", 0.8)
@@ -343,7 +353,7 @@ class Task1MissionController(Node):
         self.declare_parameter("segmentation_timeout_seconds", 1.5)
         self.declare_parameter("segmentation_missing_grace_seconds", 0.8)
         self.declare_parameter("segmentation_smoothing_alpha", 0.45)
-        self.declare_parameter("drivable_center_tolerance", 110.0)
+        self.declare_parameter("drivable_center_tolerance",100.0)
         self.declare_parameter("drivable_soft_turn_tolerance", 45.0)
         self.declare_parameter("drivable_bridge_soft_turn_tolerance", 45.0)
         self.declare_parameter("drivable_turn_hysteresis_pixels", 15.0)
@@ -388,14 +398,14 @@ class Task1MissionController(Node):
         self.declare_parameter("grab_bbox_min_center_y_ratio", 0.55)
         self.declare_parameter("grab_bbox_min_bottom_y_ratio", 0.72)
         self.declare_parameter("grab_bbox_max_bottom_y_ratio", 1.0)
-        self.declare_parameter("grab_bbox_min_area_ratio", 0.008)
+        self.declare_parameter("grab_bbox_min_area_ratio", 0.00008) #*
         self.declare_parameter("grab_gate_loss_grace_seconds", 0.4)
         self.declare_parameter("task2_target_bridge_min_overlap_ratio", 0.12)
         self.declare_parameter("task2_target_bridge_min_lower_overlap_ratio", 0.20)
         self.declare_parameter("task2_target_bridge_confirm_seconds", 0.5)
         self.declare_parameter("task2_target_bridge_loss_grace_seconds", 0.7)
-        self.declare_parameter("task2_bridge_corridor_min_width_ratio", 0.18)
-        self.declare_parameter("task2_bridge_corridor_side_margin_pixels", 35.0)
+        self.declare_parameter("task2_bridge_corridor_min_width_ratio", 0.20) #*
+        self.declare_parameter("task2_bridge_corridor_side_margin_pixels", 30.0)
         self.declare_parameter("task2_bridge_corridor_center_tolerance", 25.0)
         self.declare_parameter("task2_bridge_corridor_hard_tolerance", 75.0)
         self.declare_parameter("task2_bridge_corridor_loss_grace_seconds", 0.5)
@@ -490,18 +500,18 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_entry_allow_cautious_forward_without_map_sides", True)
         self.declare_parameter("task2_side_view_recovery_enabled", True)
         self.declare_parameter("task2_side_view_max_turn_seconds", 2.5)
-        self.declare_parameter("task2_side_view_backup_seconds", 0.6)
+        self.declare_parameter("task2_side_view_backup_seconds", 0.5)
         self.declare_parameter("task2_side_view_road_follow_seconds", 2.0)
         self.declare_parameter("task2_side_view_stuck_timeout_seconds", 1.2)
         self.declare_parameter("task2_side_view_min_ramp_confidence", 0.45)
-        self.declare_parameter("task2_side_view_max_score", 0.50)
+        self.declare_parameter("task2_side_view_max_score", 0.55)
         self.declare_parameter("task2_allow_ramp_fallback_entry", True)
-        self.declare_parameter("task2_ramp_entry_min_confidence", 0.75)
+        self.declare_parameter("task2_ramp_entry_min_confidence", 0.55)
         self.declare_parameter("task2_ramp_entry_confirm_frames", 6)
         self.declare_parameter("task2_ramp_entry_center_tolerance_pixels", 35.0)
         self.declare_parameter("task2_ramp_entry_min_bottom_y_ratio", 0.70)
         self.declare_parameter("task2_ramp_entry_min_vertical_coverage", 0.45)
-        self.declare_parameter("task2_ramp_entry_max_side_view_score", 0.40)
+        self.declare_parameter("task2_ramp_entry_max_side_view_score", 0.45)
         self.declare_parameter("task2_top_use_tf_z", True)
         self.declare_parameter("task2_top_z_threshold_m", 0.18)
         self.declare_parameter("task2_top_min_ascent_seconds", 7.0)
@@ -532,7 +542,7 @@ class Task1MissionController(Node):
         self.declare_parameter("stuck_recovery_turn_seconds", 0.7)
         self.declare_parameter("stuck_recovery_shift_seconds", 0.5)
         self.declare_parameter("stuck_recovery_cooldown_seconds", 1.0)
-        self.declare_parameter("virtual_obstacle_enabled", True)
+        self.declare_parameter("virtual_obstacle_enabled", False)
         self.declare_parameter("virtual_obstacle_front_distance", 0.45)
         self.declare_parameter("virtual_obstacle_diagonal_distance", 0.42)
         self.declare_parameter("virtual_obstacle_radius", 0.35)
@@ -674,6 +684,30 @@ class Task1MissionController(Node):
         )
         self.task2_ascent_centering_enabled = self._bool_param(
             "task2_ascent_centering_enabled"
+        )
+        self.task2_ascent_stop_on_bridge_loss_seconds = self._double_param(
+            "task2_ascent_stop_on_bridge_loss_seconds"
+        )
+        self.task2_ascent_bear_pid_enabled = self._bool_param(
+            "task2_ascent_bear_pid_enabled"
+        )
+        self.task2_ascent_bear_pid_center_tolerance_pixels = self._double_param(
+            "task2_ascent_bear_pid_center_tolerance_pixels"
+        )
+        self.task2_ascent_bear_pid_kp = self._double_param("task2_ascent_bear_pid_kp")
+        self.task2_ascent_bear_pid_ki = self._double_param("task2_ascent_bear_pid_ki")
+        self.task2_ascent_bear_pid_kd = self._double_param("task2_ascent_bear_pid_kd")
+        self.task2_ascent_bear_pid_integral_limit = self._double_param(
+            "task2_ascent_bear_pid_integral_limit"
+        )
+        self.task2_ascent_bear_pid_max_turn = self._double_param(
+            "task2_ascent_bear_pid_max_turn"
+        )
+        self.task2_ascent_bear_pid_rotate_only_pixels = self._double_param(
+            "task2_ascent_bear_pid_rotate_only_pixels"
+        )
+        self.task2_ascent_bear_pid_forward_scale = self._double_param(
+            "task2_ascent_bear_pid_forward_scale"
         )
         self.task2_descent_min_seconds = self._double_param("task2_descent_min_seconds")
         self.task2_descent_timeout = self._double_param("task2_descent_timeout_seconds")
@@ -1596,6 +1630,9 @@ class Task1MissionController(Node):
         self.task2_final_align_close_loss_start_time = None
         self.task2_ascent_stop_start_time = None
         self.task2_ascent_lost_bridge_start_time = None
+        self.task2_ascent_bear_pid_integral = 0.0
+        self.task2_ascent_bear_pid_last_error = None
+        self.task2_ascent_bear_pid_last_time = None
         self.task2_ramp_entry_confirm_count = 0
         self.task2_side_view_recovery_start_time = None
         self.task2_side_view_recovery_direction = 1.0
@@ -3844,20 +3881,21 @@ class Task1MissionController(Node):
         ), reason
 
     def _task2_bridge_bear_ascent_action(self):
+        if not self.task2_ascent_bear_pid_enabled:
+            return None
         delta, _ = self._task2_bridge_bear_delta_for_ascent(require_surface=True)
         if delta is None:
+            self._reset_task2_ascent_bear_pid()
             return None
-        soft_tolerance = max(1.0, self.task2_turn_frontal_bridge_bear_tolerance_pixels)
-        hard_tolerance = max(soft_tolerance * 2.0, self.align_pixel_tolerance)
-        if abs(delta) > hard_tolerance:
-            return (
-                "CLOCKWISE_ROTATION_SLOW"
-                if delta > 0.0
-                else "COUNTERCLOCKWISE_ROTATION_SLOW"
-            )
-        if abs(delta) > soft_tolerance:
-            return "RIGHT_FRONT" if delta > 0.0 else "LEFT_FRONT"
-        return None
+        if abs(delta) <= self.task2_ascent_bear_pid_center_tolerance_pixels:
+            self._reset_task2_ascent_bear_pid()
+            return None
+        return "ASCEND_BEAR_PID"
+
+    def _reset_task2_ascent_bear_pid(self):
+        self.task2_ascent_bear_pid_integral = 0.0
+        self.task2_ascent_bear_pid_last_error = None
+        self.task2_ascent_bear_pid_last_time = None
 
     def _task2_frontal_bridge_base_ready_for_ascent(self, bridge, delta_x=None):
         if not self.task2_turn_allow_frontal_bridge_ascent:
@@ -4540,7 +4578,7 @@ class Task1MissionController(Node):
             self.bridge_top_confirm_count = 0
             self.bridge_top_confirmed = False
             self.get_logger().info(
-                "Task 2 ascent: strong ramp climb with top-confidence gating."
+                "Task 2 ascent: climbing until the bridge mask leaves the camera frame."
             )
 
         if self.task2_ascent_stop_start_time is not None:
@@ -4562,46 +4600,39 @@ class Task1MissionController(Node):
 
         self._update_bridge_bear_memory()
 
-        if self.task2_use_bridge_top_pose:
-            if self._goal_reached(self.task2_bridge_top_pose):
-                self._clear_navigation()
-                self._start_task2_ascent_settle()
-                return
-            self._navigate_state(
-                goal_name="task2_bridge_top_pose",
-                goal=self.task2_bridge_top_pose,
-                next_state=MissionState.TASK2_SEARCH_BRIDGE_BEAR,
-            )
-            return
-
         elapsed = self._elapsed_seconds(self.task2_phase_start_time)
+        bridge = self._task2_bridge_visible(allow_cached=False)
+        bridge_mask_visible = bridge is not None and self._bridge_observation_is_fresh(bridge)
+
         top_ok, top_score, top_reason = self._bridge_top_confidence()
         self.bridge_top_visual_confidence = top_score
-        self.bridge_top_confidence_reason = top_reason
-        if top_ok:
-            self.bridge_top_confirm_count += 1
-        else:
-            self.bridge_top_confirm_count = 0
+        self.bridge_top_confidence_reason = (
+            "bridge mask visible; ascent continues"
+            if bridge_mask_visible
+            else f"bridge mask lost; {top_reason}"
+        )
 
-        max_ascent_time = self.task2_ascent_timeout
-        if self.task2_ascent_continue_if_not_top:
-            max_ascent_time += max(0.0, self.task2_ascent_max_extra_seconds)
-        max_time_reached = elapsed >= max_ascent_time
-        budget_reached = self._budget_exceeded(self.task2_ascent_budget_seconds)
-        if (
-            self.bridge_top_confirm_count >= self.task2_top_confirm_frames
-            or max_time_reached
-            or budget_reached
-        ):
-            if not top_ok and self.task2_ascent_require_top_confidence and not max_time_reached:
-                self.get_logger().info(
-                    "Task 2 ascent continuing: top confidence not reached "
-                    f"(score={top_score:.2f}, reason={top_reason})."
-                )
-            else:
+        if not bridge_mask_visible:
+            self._reset_task2_ascent_bear_pid()
+            self._publish_action("STOP")
+            if self.task2_ascent_lost_bridge_start_time is None:
+                self.task2_ascent_lost_bridge_start_time = self.get_clock().now()
                 self._log_event(
                     "info",
-                    "task2_ascent_top_gate",
+                    "task2_ascent_bridge_mask_lost",
+                    elapsed=elapsed,
+                    top_confidence=top_ok,
+                    top_score=top_score,
+                    reason=top_reason,
+                )
+                return
+            if (
+                self._elapsed_seconds(self.task2_ascent_lost_bridge_start_time)
+                >= self.task2_ascent_stop_on_bridge_loss_seconds
+            ):
+                self._log_event(
+                    "info",
+                    "task2_ascent_bridge_mask_loss_gate",
                     top_confidence=top_ok,
                     top_score=top_score,
                     reason=top_reason,
@@ -4612,21 +4643,9 @@ class Task1MissionController(Node):
                 self.bridge_top_confirmed = True
                 self._start_task2_ascent_settle()
                 return
-
-        if elapsed < self.task2_ascent_min_seconds:
-            bridge = self._task2_bridge_visible()
-            action = AscentController.action(self, bridge)
-            self._publish_ascent_or_action(action)
             return
 
-        if top_ok and not self.task2_ascent_require_top_confidence:
-            self._start_task2_ascent_settle()
-            return
-
-        bridge = self._task2_bridge_visible()
-        if bridge is None:
-            self._publish_ascent_or_action(self.task2_ascent_action)
-            return
+        self.task2_ascent_lost_bridge_start_time = None
 
         self._publish_ascent_or_action(AscentController.action(self, bridge))
 
@@ -4641,8 +4660,103 @@ class Task1MissionController(Node):
     def _publish_ascent_or_action(self, action_key):
         if action_key == "ASCEND_FORWARD":
             self._publish_ascent_forward()
+        elif action_key == "ASCEND_BEAR_PID":
+            self._publish_ascent_bear_pid()
         else:
             self._publish_action(action_key)
+
+    def _publish_ascent_bear_pid(self):
+        recovery_action = self._apply_stuck_recovery("FORWARD")
+        if recovery_action != "FORWARD":
+            self._reset_task2_ascent_bear_pid()
+            self._publish_action(recovery_action)
+            return
+
+        delta, reason = self._task2_bridge_bear_delta_for_ascent(require_surface=True)
+        if delta is None:
+            self._reset_task2_ascent_bear_pid()
+            self._publish_ascent_forward()
+            return
+
+        now = self.get_clock().now()
+        now_sec = now.nanoseconds / 1e9
+        if self.task2_ascent_bear_pid_last_time is None:
+            dt = 0.0
+            derivative = 0.0
+        else:
+            dt = max(1e-3, now_sec - self.task2_ascent_bear_pid_last_time)
+            derivative = (
+                float(delta) - float(self.task2_ascent_bear_pid_last_error)
+            ) / dt
+        if dt > 0.0:
+            self.task2_ascent_bear_pid_integral += float(delta) * dt
+            integral_limit = abs(self.task2_ascent_bear_pid_integral_limit)
+            self.task2_ascent_bear_pid_integral = max(
+                -integral_limit,
+                min(integral_limit, self.task2_ascent_bear_pid_integral),
+            )
+        self.task2_ascent_bear_pid_last_error = float(delta)
+        self.task2_ascent_bear_pid_last_time = now_sec
+
+        slow = ACTION_MAPPINGS.get("FORWARD_SLOW", [0.0, 0.0, 0.0, 0.0])
+        fast = ACTION_MAPPINGS.get("FORWARD", slow)
+        max_wheel_speed = max(abs(float(value)) for value in fast + slow) or 1.0
+        base_speed = min(
+            abs(float(slow[0]))
+            * self.task2_ascent_forward_speed_scale
+            * self.task2_ascent_bear_pid_forward_scale,
+            max_wheel_speed,
+        )
+        if abs(delta) >= self.task2_ascent_bear_pid_rotate_only_pixels:
+            base_speed = 0.0
+
+        max_turn = min(abs(self.task2_ascent_bear_pid_max_turn), max_wheel_speed)
+        pid_turn = (
+            self.task2_ascent_bear_pid_kp * float(delta)
+            + self.task2_ascent_bear_pid_ki * self.task2_ascent_bear_pid_integral
+            + self.task2_ascent_bear_pid_kd * derivative
+        )
+        turn_speed = max(
+            -max_turn,
+            min(max_turn, pid_turn),
+        )
+        velocities = [
+            base_speed + turn_speed,
+            base_speed - turn_speed,
+            base_speed + turn_speed,
+            base_speed - turn_speed,
+        ]
+        velocities = [
+            max(-max_wheel_speed, min(max_wheel_speed, float(value)))
+            for value in velocities
+        ]
+
+        rear_msg = Float32MultiArray()
+        rear_msg.data = [velocities[0], velocities[1]]
+        self.rear_pub.publish(rear_msg)
+
+        front_msg = Float32MultiArray()
+        front_msg.data = [velocities[2], velocities[3]]
+        self.front_pub.publish(front_msg)
+
+        if (
+            self.last_logged_action != "ASCEND_BEAR_PID"
+            or self.last_action_log_time is None
+            or self._elapsed_seconds(self.last_action_log_time) >= 0.5
+        ):
+            self.last_logged_action = "ASCEND_BEAR_PID"
+            self.last_action_log_time = now
+            self._log_event(
+                "info",
+                "ascent_bear_pid_action",
+                action="ASCEND_BEAR_PID",
+                bear_delta_x=delta,
+                turn_speed=turn_speed,
+                base_speed=base_speed,
+                pid_integral=self.task2_ascent_bear_pid_integral,
+                pid_derivative=derivative,
+                reason=reason,
+            )
 
     def _publish_ascent_forward(self):
         recovery_action = self._apply_stuck_recovery("FORWARD")

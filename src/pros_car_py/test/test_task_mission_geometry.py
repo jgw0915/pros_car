@@ -264,6 +264,17 @@ def _bridge_node():
     node.task2_side_view_max_score = 0.55
     node.task2_bridge_approach_hard_tolerance = 100.0
     node.task2_bridge_approach_soft_tolerance = 45.0
+    node.task2_turn_allow_frontal_bridge_ascent = True
+    node.task2_turn_frontal_bridge_min_frontalness = 0.82
+    node.task2_turn_frontal_bridge_min_confidence = 0.80
+    node.task2_turn_frontal_bridge_min_bottom_y_ratio = 0.95
+    node.task2_turn_frontal_bridge_center_tolerance_pixels = 65.0
+    node.task2_turn_frontal_bridge_bear_tolerance_pixels = 70.0
+    node.task2_turn_frontal_bridge_require_target = True
+    node.task2_target_bridge_min_overlap_ratio = 0.12
+    node.task2_target_bridge_min_lower_overlap_ratio = 0.20
+    node.target_timeout = 1.0
+    node.align_pixel_tolerance = 80.0
     node.task2_top_use_tf_z = True
     node.task2_top_z_threshold = 0.18
     node.task2_top_min_ascent_seconds = 7.0
@@ -335,6 +346,13 @@ def _bridge_node():
         "_task2_bridge_entry_delta",
         "_task2_bridge_pre_entry_delta",
         "_task2_remember_bridge_delta",
+        "_target_surface_candidate",
+        "_task2_bridge_confidence_for_ascent",
+        "_task2_bridge_bear_delta_for_ascent",
+        "_task2_bridge_bear_turn_action",
+        "_task2_bridge_bear_ascent_action",
+        "_task2_frontal_bridge_base_ready_for_ascent",
+        "_task2_frontal_bridge_ready_for_ascent",
         "_bridge_top_confidence",
         "_bridge_top_visual_score",
         "_make_marker",
@@ -965,6 +983,28 @@ def _yolo_node_without_init():
     return object.__new__(module.YoloDetectionNode)
 
 
+def test_target_surface_info_marks_side_contact_with_bridge_mask():
+    node = _yolo_node_without_init()
+    node.target_surface_pub = DummyPublisher()
+    bridge = np.zeros((480, 640), dtype=bool)
+    bridge[180:250, 342:348] = True
+    target = {
+        "x1": 300,
+        "y1": 180,
+        "x2": 340,
+        "y2": 250,
+        "center_x": 320,
+        "center_y": 215,
+    }
+
+    node.publish_target_surface_info(target, bridge)
+    data = node.target_surface_pub.messages[-1].data
+
+    assert data[2] == 0.0
+    assert data[10] == 1.0
+    assert data[12] > 0.0
+
+
 def test_bridge_ramp_valid_when_centered_lower_and_continuous():
     node = _yolo_node_without_init()
     bridge = np.zeros((480, 640), dtype=bool)
@@ -1035,6 +1075,86 @@ def test_missing_contact_can_use_confirmed_ramp_fallback():
         source = Task1MissionController._task2_entry_source(node, bridge)
 
     assert source == "ramp_fallback"
+
+
+def test_target_surface_candidate_accepts_bridge_side_contact():
+    node = _bridge_node()
+    node.target_surface_stamp = types.SimpleNamespace(nanoseconds=1_000_000_000)
+    node.target_surface_info = {
+        "target_found": True,
+        "bridge_found": True,
+        "bbox_bridge_overlap_ratio": 0.0,
+        "bbox_lower_half_bridge_overlap_ratio": 0.0,
+        "target_center_on_bridge": False,
+        "target_bottom_center_on_bridge": False,
+        "target_side_bridge_contact": True,
+        "target_side_bridge_contact_ratio": 0.06,
+    }
+
+    valid, reason = Task1MissionController._target_surface_candidate(node)
+
+    assert valid
+    assert "side" in reason
+
+
+def test_frontal_bridge_gate_allows_ascent_without_road_contact_when_bear_centered():
+    node = _bridge_node()
+    node._target_visible = lambda: True
+    node.yolo_target = {"delta_x": 12.0}
+    node.target_surface_stamp = types.SimpleNamespace(nanoseconds=1_000_000_000)
+    node.target_surface_info = {
+        "target_found": True,
+        "bridge_found": True,
+        "target_side_bridge_contact": True,
+        "target_side_bridge_contact_ratio": 0.08,
+        "bbox_bridge_overlap_ratio": 0.0,
+        "bbox_lower_half_bridge_overlap_ratio": 0.0,
+    }
+    bridge = {
+        "raw_found": True,
+        "frontalness": 0.90,
+        "ramp_confidence": 0.88,
+        "bottom_y_ratio": 0.98,
+        "bottom_center_x": 320.0,
+        "mid_center_x": 320.0,
+    }
+
+    ready, reason = Task1MissionController._task2_frontal_bridge_ready_for_ascent(
+        node, bridge, delta_x=8.0
+    )
+
+    assert ready
+    assert "bear centered" in reason
+
+
+def test_frontal_bridge_gate_rejects_off_center_bridge_bear():
+    node = _bridge_node()
+    node._target_visible = lambda: True
+    node.yolo_target = {"delta_x": 120.0}
+    node.target_surface_stamp = types.SimpleNamespace(nanoseconds=1_000_000_000)
+    node.target_surface_info = {
+        "target_found": True,
+        "bridge_found": True,
+        "target_side_bridge_contact": True,
+        "target_side_bridge_contact_ratio": 0.08,
+        "bbox_bridge_overlap_ratio": 0.0,
+        "bbox_lower_half_bridge_overlap_ratio": 0.0,
+    }
+    bridge = {
+        "raw_found": True,
+        "frontalness": 0.90,
+        "ramp_confidence": 0.88,
+        "bottom_y_ratio": 0.98,
+        "bottom_center_x": 320.0,
+        "mid_center_x": 320.0,
+    }
+
+    ready, reason = Task1MissionController._task2_frontal_bridge_ready_for_ascent(
+        node, bridge, delta_x=8.0
+    )
+
+    assert not ready
+    assert "not centered" in reason
 
 
 def test_bridge_bottom_center_alone_cannot_confirm_entry():

@@ -173,6 +173,11 @@ class AscentController:
 
     @staticmethod
     def action(node, bridge):
+        bear_action = None
+        if hasattr(node, "_task2_bridge_bear_ascent_action"):
+            bear_action = node._task2_bridge_bear_ascent_action()
+        if bear_action is not None:
+            return bear_action
         if not node.task2_ascent_centering_enabled or bridge is None:
             return node.task2_ascent_action
         delta = BridgeVisionAnalyzer.ramp_delta(node, bridge)
@@ -406,6 +411,13 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_turn_wrong_way_limit", 2)
         self.declare_parameter("task2_turn_direction_sign", 1.0)
         self.declare_parameter("task2_turn_auto_flip_enabled", True)
+        self.declare_parameter("task2_turn_allow_frontal_bridge_ascent", True)
+        self.declare_parameter("task2_turn_frontal_bridge_min_frontalness", 0.82)
+        self.declare_parameter("task2_turn_frontal_bridge_min_confidence", 0.80)
+        self.declare_parameter("task2_turn_frontal_bridge_min_bottom_y_ratio", 0.95)
+        self.declare_parameter("task2_turn_frontal_bridge_center_tolerance_pixels", 65.0)
+        self.declare_parameter("task2_turn_frontal_bridge_bear_tolerance_pixels", 70.0)
+        self.declare_parameter("task2_turn_frontal_bridge_require_target", True)
         self.declare_parameter("task2_approach_min_seconds", 1.0)
         self.declare_parameter("task2_entry_close_confirm_frames", 5)
         self.declare_parameter("task2_entry_close_max_range_m", 0.90)
@@ -458,7 +470,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_target_total_budget_seconds", 360.0)
         self.declare_parameter("task2_search_budget_seconds", 45.0)
         self.declare_parameter("task2_entry_budget_seconds", 90.0)
-        self.declare_parameter("task2_ascent_budget_seconds", 18.0)
+        self.declare_parameter("task2_ascent_budget_seconds", 20.0)
         self.declare_parameter("task2_top_bear_search_budget_seconds", 60.0)
         self.declare_parameter("task2_descent_budget_seconds", 12.0)
         self.declare_parameter("task_return_budget_seconds", 90.0)
@@ -478,18 +490,18 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_entry_allow_cautious_forward_without_map_sides", True)
         self.declare_parameter("task2_side_view_recovery_enabled", True)
         self.declare_parameter("task2_side_view_max_turn_seconds", 2.5)
-        self.declare_parameter("task2_side_view_backup_seconds", 0.5)
+        self.declare_parameter("task2_side_view_backup_seconds", 0.6)
         self.declare_parameter("task2_side_view_road_follow_seconds", 2.0)
         self.declare_parameter("task2_side_view_stuck_timeout_seconds", 1.2)
         self.declare_parameter("task2_side_view_min_ramp_confidence", 0.45)
-        self.declare_parameter("task2_side_view_max_score", 0.55)
+        self.declare_parameter("task2_side_view_max_score", 0.50)
         self.declare_parameter("task2_allow_ramp_fallback_entry", True)
-        self.declare_parameter("task2_ramp_entry_min_confidence", 0.55)
+        self.declare_parameter("task2_ramp_entry_min_confidence", 0.75)
         self.declare_parameter("task2_ramp_entry_confirm_frames", 6)
         self.declare_parameter("task2_ramp_entry_center_tolerance_pixels", 35.0)
         self.declare_parameter("task2_ramp_entry_min_bottom_y_ratio", 0.70)
         self.declare_parameter("task2_ramp_entry_min_vertical_coverage", 0.45)
-        self.declare_parameter("task2_ramp_entry_max_side_view_score", 0.45)
+        self.declare_parameter("task2_ramp_entry_max_side_view_score", 0.40)
         self.declare_parameter("task2_top_use_tf_z", True)
         self.declare_parameter("task2_top_z_threshold_m", 0.18)
         self.declare_parameter("task2_top_min_ascent_seconds", 7.0)
@@ -1033,6 +1045,27 @@ class Task1MissionController(Node):
         self.task2_turn_direction_sign = self._double_param("task2_turn_direction_sign")
         self.task2_turn_auto_flip_enabled = self._bool_param(
             "task2_turn_auto_flip_enabled"
+        )
+        self.task2_turn_allow_frontal_bridge_ascent = self._bool_param(
+            "task2_turn_allow_frontal_bridge_ascent"
+        )
+        self.task2_turn_frontal_bridge_min_frontalness = self._double_param(
+            "task2_turn_frontal_bridge_min_frontalness"
+        )
+        self.task2_turn_frontal_bridge_min_confidence = self._double_param(
+            "task2_turn_frontal_bridge_min_confidence"
+        )
+        self.task2_turn_frontal_bridge_min_bottom_y_ratio = self._double_param(
+            "task2_turn_frontal_bridge_min_bottom_y_ratio"
+        )
+        self.task2_turn_frontal_bridge_center_tolerance_pixels = self._double_param(
+            "task2_turn_frontal_bridge_center_tolerance_pixels"
+        )
+        self.task2_turn_frontal_bridge_bear_tolerance_pixels = self._double_param(
+            "task2_turn_frontal_bridge_bear_tolerance_pixels"
+        )
+        self.task2_turn_frontal_bridge_require_target = self._bool_param(
+            "task2_turn_frontal_bridge_require_target"
         )
         self.task2_approach_min_seconds = self._double_param(
             "task2_approach_min_seconds"
@@ -1903,6 +1936,7 @@ class Task1MissionController(Node):
             "target_on_bridge": bool(
                 target_surface.get("target_bottom_center_on_bridge", False)
                 or target_surface.get("target_center_on_bridge", False)
+                or target_surface.get("target_side_bridge_contact", False)
             ),
             "virtual_obstacle_count": len(getattr(self, "virtual_obstacles", [])),
             "augmented_map_obstacle_cell_count": getattr(
@@ -2115,6 +2149,21 @@ class Task1MissionController(Node):
             "target_bottom_center_on_bridge": msg.data[5] >= 0.5,
             "image_width": msg.data[6],
             "image_height": msg.data[7],
+            "target_left_side_bridge_contact": (
+                len(msg.data) >= 13 and msg.data[8] >= 0.5
+            ),
+            "target_right_side_bridge_contact": (
+                len(msg.data) >= 13 and msg.data[9] >= 0.5
+            ),
+            "target_side_bridge_contact": (
+                len(msg.data) >= 13 and msg.data[10] >= 0.5
+            ),
+            "target_side_bridge_contact_ratio": (
+                msg.data[11] if len(msg.data) >= 13 else 0.0
+            ),
+            "target_side_bridge_contact_pixels": (
+                msg.data[12] if len(msg.data) >= 13 else 0.0
+            ),
         }
         self.target_surface_stamp = self.get_clock().now()
 
@@ -3747,6 +3796,118 @@ class Task1MissionController(Node):
             return "RIGHT_FRONT" if error > 0.0 else "LEFT_FRONT"
         return self._avoid_virtual_obstacle_for_action("FORWARD_SLOW")
 
+    def _task2_bridge_confidence_for_ascent(self, bridge):
+        landmark = getattr(self, "bridge_landmark", {}) or {}
+        values = [
+            float(landmark.get("confidence", 0.0)),
+            float(bridge.get("entry_confidence", 0.0)) if bridge else 0.0,
+            float(bridge.get("ramp_confidence", 0.0)) if bridge else 0.0,
+            float(bridge.get("target_confidence", 0.0)) if bridge else 0.0,
+        ]
+        return max(values)
+
+    def _task2_bridge_bear_delta_for_ascent(self, require_surface=True):
+        if not self._target_visible():
+            return None, "bridge bear target is not visible"
+        if require_surface:
+            surface_valid, surface_reason = self._target_surface_candidate()
+            if not surface_valid:
+                return None, surface_reason
+
+        target = self.yolo_target or {}
+        if "delta_x" in target:
+            return float(target.get("delta_x", 0.0)), "bridge bear target is visible"
+
+        bbox = self.yolo_bbox or {}
+        image_width = float(
+            bbox.get("image_width", 0.0)
+            or target.get("image_width", 0.0)
+            or self._segmentation_image_width()
+        )
+        center_x = float(bbox.get("center_x", 0.0) or target.get("center_x", 0.0))
+        if image_width > 0.0 and center_x > 0.0:
+            return center_x - image_width * 0.5, "bridge bear bbox is visible"
+        return None, "bridge bear has no image-center measurement"
+
+    def _task2_bridge_bear_turn_action(self, require_surface=True):
+        delta, reason = self._task2_bridge_bear_delta_for_ascent(
+            require_surface=require_surface
+        )
+        if delta is None:
+            return None, reason
+        if abs(delta) <= self.task2_turn_frontal_bridge_bear_tolerance_pixels:
+            return "STOP", "bridge bear centered"
+        return (
+            "CLOCKWISE_ROTATION_SLOW"
+            if delta > 0.0
+            else "COUNTERCLOCKWISE_ROTATION_SLOW"
+        ), reason
+
+    def _task2_bridge_bear_ascent_action(self):
+        delta, _ = self._task2_bridge_bear_delta_for_ascent(require_surface=True)
+        if delta is None:
+            return None
+        soft_tolerance = max(1.0, self.task2_turn_frontal_bridge_bear_tolerance_pixels)
+        hard_tolerance = max(soft_tolerance * 2.0, self.align_pixel_tolerance)
+        if abs(delta) > hard_tolerance:
+            return (
+                "CLOCKWISE_ROTATION_SLOW"
+                if delta > 0.0
+                else "COUNTERCLOCKWISE_ROTATION_SLOW"
+            )
+        if abs(delta) > soft_tolerance:
+            return "RIGHT_FRONT" if delta > 0.0 else "LEFT_FRONT"
+        return None
+
+    def _task2_frontal_bridge_base_ready_for_ascent(self, bridge, delta_x=None):
+        if not self.task2_turn_allow_frontal_bridge_ascent:
+            return False, "frontal bridge ascent bypass is disabled"
+        if bridge is None or not self._bridge_observation_is_fresh(bridge):
+            return False, "bridge observation is not fresh"
+        if not bridge.get("raw_found", bridge.get("found", False)):
+            return False, "bridge mask is cached"
+
+        frontalness = float(bridge.get("frontalness", 0.0))
+        if frontalness < self.task2_turn_frontal_bridge_min_frontalness:
+            return False, f"frontalness too low ({frontalness:.2f})"
+
+        confidence = self._task2_bridge_confidence_for_ascent(bridge)
+        if confidence < self.task2_turn_frontal_bridge_min_confidence:
+            return False, f"bridge confidence too low ({confidence:.2f})"
+
+        bottom_y = float(bridge.get("bottom_y_ratio", 0.0))
+        if bottom_y < self.task2_turn_frontal_bridge_min_bottom_y_ratio:
+            return False, f"bridge bottom y too high ({bottom_y:.2f})"
+
+        if delta_x is None:
+            delta_x = BridgeVisionAnalyzer.ramp_delta(self, bridge)
+        if delta_x is None:
+            delta_x = self._task2_bridge_rough_target_delta(bridge)
+        if delta_x is None:
+            return False, "no bridge center measurement"
+        if abs(delta_x) > self.task2_turn_frontal_bridge_center_tolerance_pixels:
+            return False, f"bridge center error too large ({delta_x:.0f}px)"
+        return True, "frontal bridge fills lower frame and is centered"
+
+    def _task2_frontal_bridge_ready_for_ascent(self, bridge, delta_x=None):
+        ready, reason = self._task2_frontal_bridge_base_ready_for_ascent(
+            bridge, delta_x=delta_x
+        )
+        if not ready:
+            return False, reason
+
+        if not self.task2_turn_frontal_bridge_require_target:
+            return True, reason
+
+        bear_delta, bear_reason = self._task2_bridge_bear_delta_for_ascent(
+            require_surface=True
+        )
+        if bear_delta is None:
+            return False, bear_reason
+        if abs(bear_delta) > self.task2_turn_frontal_bridge_bear_tolerance_pixels:
+            return False, f"bridge bear is not centered ({bear_delta:.0f}px)"
+        return True, f"{reason}; bridge bear centered"
+
     def _task2_turn_to_bridge(self):
         if self.task2_turn_state_start_time is None:
             self.task2_turn_state_start_time = self.get_clock().now()
@@ -3773,6 +3934,18 @@ class Task1MissionController(Node):
 
         if fresh and delta_x is not None:
             self._task2_evaluate_turn_pulse(delta_x)
+            frontal_base_ready, _ = self._task2_frontal_bridge_base_ready_for_ascent(
+                bridge, delta_x=delta_x
+            )
+            if frontal_base_ready:
+                bear_action, _ = self._task2_bridge_bear_turn_action(
+                    require_surface=True
+                )
+                if bear_action is not None and bear_action != "STOP":
+                    self.task2_turn_centered_frames = 0
+                    self._publish_action(bear_action)
+                    return
+
             if abs(delta_x) <= self.task2_turn_visual_deadband_pixels:
                 self.task2_turn_centered_frames += 1
                 self._publish_action("STOP")
@@ -3781,13 +3954,32 @@ class Task1MissionController(Node):
                     >= self.task2_turn_center_confirm_frames
                     and self._elapsed_seconds(self.task2_turn_state_start_time)
                     >= self.task2_turn_min_state_seconds
-                    and self._task2_entry_source(bridge) != "none"
                 ):
-                    self.get_logger().info(
-                        "Task 2: bridge turn centered with fresh frames; approaching entry."
-                    )
-                    self._reset_bridge_turn_controller()
-                    self._set_state(MissionState.TASK2_APPROACH_BRIDGE_ENTRY)
+                    entry_source = self._task2_entry_source(bridge)
+                    if entry_source != "none":
+                        self.get_logger().info(
+                            "Task 2: bridge turn centered with fresh frames; approaching entry."
+                        )
+                        self._reset_bridge_turn_controller()
+                        self._set_state(MissionState.TASK2_APPROACH_BRIDGE_ENTRY)
+                    else:
+                        frontal_ready, frontal_reason = (
+                            self._task2_frontal_bridge_ready_for_ascent(
+                                bridge, delta_x=delta_x
+                            )
+                        )
+                        if frontal_ready:
+                            self.get_logger().info(
+                                "Task 2: bridge is frontal, low in frame, and bear-centered; "
+                                "ascending without road-contact entry."
+                            )
+                            self._log_event(
+                                "info",
+                                "task2_frontal_bridge_ascent_bypass",
+                                reason=frontal_reason,
+                            )
+                            self._reset_bridge_turn_controller()
+                            self._set_state(MissionState.TASK2_ASCEND_BRIDGE)
                 return
             self.task2_turn_centered_frames = 0
             action = self._task2_turn_pulse_action(delta_x)
@@ -4662,6 +4854,7 @@ class Task1MissionController(Node):
                 confidence,
                 float(self.target_surface_info.get("bbox_bridge_overlap_ratio", 0.0)),
                 float(self.target_surface_info.get("bbox_lower_half_bridge_overlap_ratio", 0.0)),
+                float(self.target_surface_info.get("target_side_bridge_contact_ratio", 0.0)),
             )
         if surface_candidate or self.bridge_top_confirmed or confidence >= self.task2_bridge_bear_memory_min_confidence:
             self.bridge_bear_memory.update(self, confidence)
@@ -6124,18 +6317,24 @@ class Task1MissionController(Node):
         lower_overlap = float(info.get("bbox_lower_half_bridge_overlap_ratio", 0.0))
         bottom_on_bridge = bool(info.get("target_bottom_center_on_bridge", False))
         center_on_bridge = bool(info.get("target_center_on_bridge", False))
+        side_contact = bool(info.get("target_side_bridge_contact", False))
+        side_ratio = float(info.get("target_side_bridge_contact_ratio", 0.0))
         valid = (
             lower_overlap >= self.task2_target_bridge_min_lower_overlap_ratio
             or overlap >= self.task2_target_bridge_min_overlap_ratio
             or bottom_on_bridge
             or center_on_bridge
+            or side_contact
         )
         if not valid:
             return (
                 False,
                 "bridge overlap too low "
-                f"(overlap={overlap:.2f}, lower={lower_overlap:.2f})",
+                f"(overlap={overlap:.2f}, lower={lower_overlap:.2f}, "
+                f"side={side_ratio:.2f})",
             )
+        if side_contact and not (bottom_on_bridge or center_on_bridge):
+            return True, "target touches bridge surface at bbox side"
         return True, "target overlaps bridge surface"
 
     def _target_on_bridge_surface(self, allow_grace=False):
@@ -6199,7 +6398,9 @@ class Task1MissionController(Node):
                 f"{reason}; overlap="
                 f"{self.target_surface_info.get('bbox_bridge_overlap_ratio', 0.0):.2f}, "
                 f"lower="
-                f"{self.target_surface_info.get('bbox_lower_half_bridge_overlap_ratio', 0.0):.2f}."
+                f"{self.target_surface_info.get('bbox_lower_half_bridge_overlap_ratio', 0.0):.2f}, "
+                f"side="
+                f"{self.target_surface_info.get('target_side_bridge_contact_ratio', 0.0):.2f}."
             )
         else:
             self.get_logger().info(f"Bridge-bear gate waiting: {reason}.")

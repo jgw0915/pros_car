@@ -393,6 +393,16 @@ class Task1MissionController(Node):
         self.declare_parameter("goal_republish_period_seconds", 1.0)
         self.declare_parameter("navigation_no_plan_timeout_seconds", 2.0)
         self.declare_parameter("return_direct_fallback", True)
+        self.declare_parameter("return_use_drivable_corridor", True)
+        self.declare_parameter("return_drivable_corridor_timeout_seconds", 0.6)
+        self.declare_parameter("return_drivable_center_tolerance_pixels", 85.0)
+        self.declare_parameter("return_drivable_soft_tolerance_pixels", 45.0)
+        self.declare_parameter("return_min_continuous_score", 0.40)
+        self.declare_parameter("return_heading_tolerance_deg", 18.0)
+        self.declare_parameter("return_recovery_backup_seconds", 0.5)
+        self.declare_parameter("return_recovery_probe_seconds", 1.1)
+        self.declare_parameter("return_recovery_scan_angle_deg", 120.0)
+        self.declare_parameter("return_recovery_yaw_tolerance_deg", 12.0)
         self.declare_parameter("lookahead_distance", 0.55)
         self.declare_parameter("angle_tolerance_deg", 20.0)
         self.declare_parameter("align_pixel_tolerance", 80.0)
@@ -1026,6 +1036,36 @@ class Task1MissionController(Node):
             "navigation_no_plan_timeout_seconds"
         )
         self.return_direct_fallback = self._bool_param("return_direct_fallback")
+        self.return_use_drivable_corridor = self._bool_param(
+            "return_use_drivable_corridor"
+        )
+        self.return_drivable_corridor_timeout = self._double_param(
+            "return_drivable_corridor_timeout_seconds"
+        )
+        self.return_drivable_center_tolerance = self._double_param(
+            "return_drivable_center_tolerance_pixels"
+        )
+        self.return_drivable_soft_tolerance = self._double_param(
+            "return_drivable_soft_tolerance_pixels"
+        )
+        self.return_min_continuous_score = self._double_param(
+            "return_min_continuous_score"
+        )
+        self.return_heading_tolerance = math.radians(
+            self._double_param("return_heading_tolerance_deg")
+        )
+        self.return_recovery_backup_seconds = self._double_param(
+            "return_recovery_backup_seconds"
+        )
+        self.return_recovery_probe_seconds = self._double_param(
+            "return_recovery_probe_seconds"
+        )
+        self.return_recovery_scan_angle = math.radians(
+            self._double_param("return_recovery_scan_angle_deg")
+        )
+        self.return_recovery_yaw_tolerance = math.radians(
+            self._double_param("return_recovery_yaw_tolerance_deg")
+        )
         self.lookahead_distance = self._double_param("lookahead_distance")
         self.angle_tolerance = math.radians(self._double_param("angle_tolerance_deg"))
         self.align_pixel_tolerance = self._double_param("align_pixel_tolerance")
@@ -1694,6 +1734,12 @@ class Task1MissionController(Node):
         self.last_goal_publish_time = None
         self.last_no_plan_log_time = None
         self.return_direct_fallback_announced = False
+        self.return_corridor_recovery_phase = None
+        self.return_corridor_recovery_phase_start_time = None
+        self.return_corridor_recovery_sign = 1.0
+        self.return_corridor_recovery_target_yaw = None
+        self.return_corridor_recovery_cycle_count = 0
+        self.return_corridor_last_log_time = None
         self.yolo_target = None
         self.yolo_target_stamp = None
         self.yolo_bbox = None
@@ -3149,11 +3195,7 @@ class Task1MissionController(Node):
         elif self.state == MissionState.VERIFY_GRAB:
             self._verify_grab()
         elif self.state == MissionState.RETURN_START:
-            self._navigate_state(
-                goal_name="start_pose",
-                goal=self.start_pose,
-                next_state=MissionState.DROP_BEAR,
-            )
+            self._return_start()
         elif self.state == MissionState.DROP_BEAR:
             self._drop_bear()
         elif self.state == MissionState.TASK2_NAVIGATE_BRIDGE:
@@ -3213,6 +3255,215 @@ class Task1MissionController(Node):
             self._log_waiting_for_plan(goal_name)
 
         self._publish_action(action)
+
+    def _return_start(self):
+        if not self._check_return_hold():
+            return
+
+        self._clear_navigation()
+        if self._goal_reached(self.start_pose):
+            self._publish_action("STOP")
+            self._reset_return_corridor_recovery()
+            self._set_state(MissionState.DROP_BEAR)
+            return
+
+        if self.return_corridor_recovery_phase is not None:
+            self._publish_action(self._return_corridor_recovery_action())
+            return
+
+        corridor_ok, _ = self._return_drivable_corridor_ok()
+        if self.return_use_drivable_corridor and not corridor_ok:
+            self._start_return_corridor_recovery("forward view is not drivable")
+            self._publish_action("BACKWARD_SLOW")
+            return
+
+        bearing_error = self._return_start_bearing_error()
+        if bearing_error is None:
+            self._publish_action("STOP")
+            return
+
+        if abs(bearing_error) > self.return_heading_tolerance:
+            self._publish_action(self._turn_action_from_bearing_error(bearing_error))
+            return
+
+        action = self._return_corridor_forward_action()
+        if action == "STOP":
+            self._start_return_corridor_recovery("corridor no longer safe for forward")
+            self._publish_action("BACKWARD_SLOW")
+            return
+        self._publish_action(action)
+
+    def _return_start_bearing_error(self):
+        if self.pose is None:
+            return None
+        target_yaw = math.atan2(
+            self.start_pose[1] - self.pose[1],
+            self.start_pose[0] - self.pose[0],
+        )
+        return normalize_angle(target_yaw - self.pose[2])
+
+    def _return_start_target_yaw(self):
+        if self.pose is None:
+            return None
+        return math.atan2(
+            self.start_pose[1] - self.pose[1],
+            self.start_pose[0] - self.pose[0],
+        )
+
+    def _return_drivable_corridor_ok(self):
+        if not self.return_use_drivable_corridor:
+            return True, "disabled"
+
+        corridor = self._fresh_return_drivable_corridor()
+        if corridor is not None:
+            if not corridor.get("valid", False):
+                return False, "corridor invalid"
+            if not corridor.get("bottom_connected", False):
+                return False, "corridor not connected to lower frame"
+            if corridor.get("side_view_likely", False):
+                return False, "corridor side-view likely"
+            if float(corridor.get("continuous_score", 0.0)) < self.return_min_continuous_score:
+                return False, "corridor not continuous"
+            if abs(float(corridor.get("error_x", 0.0))) > self.return_drivable_center_tolerance:
+                return False, "corridor center too far from camera center"
+            return True, "corridor clear"
+
+        road = self._segmentation_segment("road", allow_cached=False)
+        if road is None:
+            return False, "no fresh road mask"
+        if float(road.get("bottom_coverage", 0.0)) < self.drivable_min_bottom_coverage:
+            return False, "road does not reach lower frame"
+        if abs(self._segment_delta_x(road, "bottom_center_x")) > self.return_drivable_center_tolerance:
+            return False, "road center too far from camera center"
+        return True, "road mask clear"
+
+    def _return_corridor_forward_action(self):
+        if not self.return_use_drivable_corridor:
+            return "FORWARD_SLOW"
+
+        corridor = self._fresh_return_drivable_corridor()
+        if corridor is not None:
+            ok, _ = self._return_drivable_corridor_ok()
+            if not ok:
+                return "STOP"
+            error = float(corridor.get("error_x", 0.0))
+            if abs(error) > self.return_drivable_soft_tolerance:
+                return "RIGHT_FRONT" if error > 0.0 else "LEFT_FRONT"
+            return "FORWARD_SLOW"
+
+        road = self._segmentation_segment("road", allow_cached=False)
+        if road is None:
+            return "STOP"
+        return self._drivable_follow_action_from_segment(
+            road,
+            prefer_bridge=False,
+            forward_action="FORWARD_SLOW",
+            hard_turn_tolerance=self.return_drivable_center_tolerance,
+        )
+
+    def _fresh_return_drivable_corridor(self):
+        if self.drivable_corridor_info is None or self.drivable_corridor_stamp is None:
+            return None
+        if self._elapsed_seconds(self.drivable_corridor_stamp) > self.return_drivable_corridor_timeout:
+            return None
+        return self.drivable_corridor_info
+
+    def _start_return_corridor_recovery(self, reason):
+        now = self.get_clock().now()
+        self.return_corridor_recovery_phase = "backup"
+        self.return_corridor_recovery_phase_start_time = now
+        self.return_corridor_recovery_target_yaw = None
+        self.return_corridor_recovery_cycle_count += 1
+        if (
+            self.return_corridor_last_log_time is None
+            or self._elapsed_seconds(self.return_corridor_last_log_time) >= 1.0
+        ):
+            self.return_corridor_last_log_time = now
+            self.get_logger().warn(
+                f"Return start corridor recovery: {reason}; backing up and scanning."
+            )
+
+    def _return_corridor_recovery_action(self):
+        now = self.get_clock().now()
+        phase = self.return_corridor_recovery_phase or "backup"
+        elapsed = self._elapsed_seconds(self.return_corridor_recovery_phase_start_time)
+
+        if phase == "backup":
+            if elapsed < self.return_recovery_backup_seconds:
+                return "BACKWARD_SLOW"
+            self.return_corridor_recovery_phase = "rotate"
+            self.return_corridor_recovery_phase_start_time = now
+            self.return_corridor_recovery_target_yaw = self._return_scan_target_yaw()
+            return self._return_rotate_to_recovery_yaw_action()
+
+        if phase == "rotate":
+            corridor_ok, _ = self._return_drivable_corridor_ok()
+            yaw_error = self._return_recovery_yaw_error()
+            if (
+                not corridor_ok
+                and yaw_error is not None
+                and abs(yaw_error) <= self.return_recovery_yaw_tolerance
+            ):
+                self._advance_return_scan_side()
+                self.return_corridor_recovery_phase = "backup"
+                self.return_corridor_recovery_phase_start_time = now
+                return "BACKWARD_SLOW"
+            if (
+                corridor_ok
+                and yaw_error is not None
+                and abs(yaw_error) <= self.return_recovery_yaw_tolerance
+            ):
+                self.return_corridor_recovery_phase = "probe"
+                self.return_corridor_recovery_phase_start_time = now
+                return self._return_corridor_forward_action()
+            if yaw_error is None:
+                return "STOP"
+            return self._turn_action_from_bearing_error(yaw_error)
+
+        corridor_ok, _ = self._return_drivable_corridor_ok()
+        if not corridor_ok:
+            self._advance_return_scan_side()
+            self.return_corridor_recovery_phase = "backup"
+            self.return_corridor_recovery_phase_start_time = now
+            return "BACKWARD_SLOW"
+        if elapsed < self.return_recovery_probe_seconds:
+            return self._return_corridor_forward_action()
+
+        self._reset_return_corridor_recovery(advance_side=True)
+        return "STOP"
+
+    def _return_scan_target_yaw(self):
+        start_yaw = self._return_start_target_yaw()
+        if start_yaw is None:
+            return None
+        return normalize_angle(
+            start_yaw
+            + self.return_corridor_recovery_sign * self.return_recovery_scan_angle
+        )
+
+    def _return_recovery_yaw_error(self):
+        if self.pose is None or self.return_corridor_recovery_target_yaw is None:
+            return None
+        return normalize_angle(self.return_corridor_recovery_target_yaw - self.pose[2])
+
+    def _return_rotate_to_recovery_yaw_action(self):
+        yaw_error = self._return_recovery_yaw_error()
+        if yaw_error is None:
+            return "STOP"
+        if abs(yaw_error) <= self.return_recovery_yaw_tolerance:
+            return "STOP"
+        return self._turn_action_from_bearing_error(yaw_error)
+
+    def _advance_return_scan_side(self):
+        self.return_corridor_recovery_sign *= -1.0
+        self.return_corridor_recovery_target_yaw = None
+
+    def _reset_return_corridor_recovery(self, advance_side=False):
+        self.return_corridor_recovery_phase = None
+        self.return_corridor_recovery_phase_start_time = None
+        self.return_corridor_recovery_target_yaw = None
+        if advance_side:
+            self._advance_return_scan_side()
 
     def _start_navigation(self, goal_name, goal):
         self.current_goal_name = goal_name
@@ -8871,6 +9122,8 @@ class Task1MissionController(Node):
             return False
         if self.current_goal_name is not None:
             return False
+        if self.state == MissionState.RETURN_START:
+            return self.return_corridor_recovery_phase == "rotate"
         return self.state in (
             MissionState.EXPLORE_MAP,
             MissionState.SEARCH_BEAR,
@@ -9078,6 +9331,11 @@ class Task1MissionController(Node):
         self.stuck_recovery_phase_start_time = None
         if state != MissionState.RETURN_START:
             self._reset_return_hold_monitor()
+        if old_state == MissionState.RETURN_START or state == MissionState.RETURN_START:
+            self._reset_return_corridor_recovery()
+        if state == MissionState.RETURN_START:
+            self.return_corridor_recovery_sign = 1.0
+            self.return_corridor_recovery_cycle_count = 0
         if state in (
             MissionState.TASK2_SEARCH_BRIDGE,
             MissionState.TASK2_EXPLORE_FOR_BRIDGE,

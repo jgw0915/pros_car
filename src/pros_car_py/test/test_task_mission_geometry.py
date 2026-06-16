@@ -430,11 +430,162 @@ def _map_node():
     return node
 
 
+def _return_node():
+    node = DummyController()
+    node.pose = (0.0, 0.0, 0.0)
+    node.start_pose = [2.0, 0.0, 0.0]
+    node.state = MissionState.RETURN_START
+    node.goal_tolerance = 0.45
+    node.current_goal_name = None
+    node.current_goal = None
+    node.latest_path = None
+    node.path_index = 0
+    node.navigation_goal_start_time = None
+    node.last_goal_publish_time = None
+    node.last_no_plan_log_time = None
+    node.return_direct_fallback_announced = False
+    node.return_use_drivable_corridor = True
+    node.return_drivable_corridor_timeout = 0.6
+    node.return_drivable_center_tolerance = 85.0
+    node.return_drivable_soft_tolerance = 45.0
+    node.return_min_continuous_score = 0.40
+    node.return_heading_tolerance = math.radians(18.0)
+    node.return_recovery_backup_seconds = 0.5
+    node.return_recovery_probe_seconds = 1.1
+    node.return_recovery_scan_angle = math.radians(120.0)
+    node.return_recovery_yaw_tolerance = math.radians(12.0)
+    node.return_corridor_recovery_phase = None
+    node.return_corridor_recovery_phase_start_time = None
+    node.return_corridor_recovery_sign = 1.0
+    node.return_corridor_recovery_target_yaw = None
+    node.return_corridor_recovery_cycle_count = 0
+    node.return_corridor_last_log_time = None
+    node.drivable_corridor_info = None
+    node.drivable_corridor_stamp = None
+    node.segmentation_info = None
+    node.segmentation_info_stamp = None
+    node.segmentation_timeout = 1.5
+    node.segmentation_missing_grace = 0.8
+    node.segmentation_last_seen = {"road": None, "bridge": None}
+    node.drivable_min_bottom_coverage = 0.04
+    node.drivable_center_tolerance = 110.0
+    node.drivable_soft_turn_tolerance = 45.0
+    node.drivable_bridge_soft_turn_tolerance = 45.0
+    node.drivable_turn_hysteresis_pixels = 15.0
+    node.drivable_anchor_bottom_coverage = 0.06
+    node.drivable_anchor_min_area_ratio = 0.01
+    node.drivable_anchor_grace_seconds = 0.35
+    node.last_drivable_action = None
+    node.last_drivable_anchor_time = None
+    node.last_drivable_delta_sign = 1.0
+    node.task2_bridge_tracking_loss_grace = 1.2
+    node.task2_turn_map_yaw_tolerance = math.radians(8.0)
+    node.now_seconds = 1.0
+    node.actions = []
+    node.get_logger = lambda: DummyLogger()
+    node.get_clock = lambda: types.SimpleNamespace(
+        now=lambda: types.SimpleNamespace(
+            nanoseconds=int(node.now_seconds * 1e9),
+            to_msg=lambda: types.SimpleNamespace(sec=1, nanosec=0),
+        )
+    )
+    node._elapsed_seconds = (
+        lambda start_time: node.now_seconds
+        - (float(getattr(start_time, "nanoseconds", 0.0)) / 1e9)
+    )
+    node._check_return_hold = lambda: True
+    node._publish_action = lambda action: node.actions.append(action)
+    for name in (
+        "_return_start",
+        "_return_start_bearing_error",
+        "_return_start_target_yaw",
+        "_return_drivable_corridor_ok",
+        "_return_corridor_forward_action",
+        "_fresh_return_drivable_corridor",
+        "_start_return_corridor_recovery",
+        "_return_corridor_recovery_action",
+        "_return_scan_target_yaw",
+        "_return_recovery_yaw_error",
+        "_return_rotate_to_recovery_yaw_action",
+        "_advance_return_scan_side",
+        "_reset_return_corridor_recovery",
+        "_clear_navigation",
+        "_goal_reached",
+        "_turn_action_from_bearing_error",
+        "_segmentation_segment",
+        "_segmentation_image_width",
+        "_segment_delta_x",
+        "_segment_center_x",
+        "_drivable_follow_action_from_segment",
+        "_needs_lower_frame_realign",
+        "_remember_drivable_direction",
+        "_reacquire_drivable_action",
+    ):
+        setattr(node, name, getattr(Task1MissionController, name).__get__(node))
+    return node
+
+
 def test_normalize_angle_wrap_adds_short_delta():
     previous = math.radians(170.0)
     current = math.radians(-170.0)
     delta = normalize_angle(current - previous)
     assert abs(math.degrees(abs(delta)) - 20.0) <= 0.5
+
+
+def test_return_start_rejects_blocked_corridor():
+    node = _return_node()
+    node.drivable_corridor_info = {
+        "valid": False,
+        "bottom_connected": False,
+        "side_view_likely": False,
+        "continuous_score": 0.0,
+        "error_x": 0.0,
+    }
+    node.drivable_corridor_stamp = node.get_clock().now()
+
+    ok, reason = Task1MissionController._return_drivable_corridor_ok(node)
+
+    assert not ok
+    assert reason == "corridor invalid"
+
+
+def test_return_start_backs_up_when_forward_view_not_drivable():
+    node = _return_node()
+    node.drivable_corridor_info = {
+        "valid": False,
+        "bottom_connected": False,
+        "side_view_likely": False,
+        "continuous_score": 0.0,
+        "error_x": 0.0,
+    }
+    node.drivable_corridor_stamp = node.get_clock().now()
+
+    Task1MissionController._return_start(node)
+
+    assert node.actions[-1] == "BACKWARD_SLOW"
+    assert node.return_corridor_recovery_phase == "backup"
+
+
+def test_return_recovery_alternates_scan_side_when_probe_view_blocked():
+    node = _return_node()
+    node.return_corridor_recovery_phase = "rotate"
+    node.return_corridor_recovery_phase_start_time = node.get_clock().now()
+    node.return_corridor_recovery_target_yaw = math.radians(120.0)
+    node.pose = (0.0, 0.0, math.radians(120.0))
+    node.drivable_corridor_info = {
+        "valid": False,
+        "bottom_connected": False,
+        "side_view_likely": False,
+        "continuous_score": 0.0,
+        "error_x": 0.0,
+    }
+    node.drivable_corridor_stamp = node.get_clock().now()
+
+    action = Task1MissionController._return_corridor_recovery_action(node)
+
+    assert action == "BACKWARD_SLOW"
+    assert node.return_corridor_recovery_phase == "backup"
+    assert node.return_corridor_recovery_sign == -1.0
 
 
 def test_lower_frame_bbox_gate_accepts_lower_target():

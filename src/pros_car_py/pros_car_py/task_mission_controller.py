@@ -60,8 +60,8 @@ class MissionState(str, Enum):
     TASK2_ASCEND_BRIDGE = "task2_ascent"
     TASK2_SEARCH_BRIDGE_BEAR = "task2_search_bridge_bear"
     TASK2_DESCEND_BRIDGE = "task2_descent"
-    TASK3_LOCATE_DOOR = "task3_locate_door"
-    TASK3_OBSERVE_AND_ALIGN = "task3_observe_and_align"
+    TASK3_EXPLORE_DOOR = "task3_explore_door"
+    TASK3_ALIGN_DOOR = "task3_align_door"
     TASK3_UNLOCK_DOOR = "task3_unlock_door"
     TASK3_CLEAR_DOOR = "task3_clear_door"
     DONE = "done"
@@ -548,15 +548,24 @@ class Task1MissionController(Node):
         self.declare_parameter("run_task3_after_done", True)
         self.declare_parameter("task3_direct_start", False)
         self.declare_parameter("task3_target_label", "door_knob")
-        self.declare_parameter("task3_door_pose", [0.0, 0.0, 0.0])
-        self.declare_parameter("task3_goal_tolerance", 0.65)
-        self.declare_parameter("task3_goal_republish_period_seconds", 1.0)
         self.declare_parameter("task3_locate_timeout_seconds", 60.0)
         self.declare_parameter("task3_use_drivable_corridor", True)
         self.declare_parameter("task3_drivable_corridor_topic", "/yolo/drivable_corridor_info")
         self.declare_parameter("task3_drivable_corridor_timeout_seconds", 0.5)
+        self.declare_parameter("task3_explore_forward_speed", 0.16)
+        self.declare_parameter("task3_explore_angular_kp", 0.0035)
+        self.declare_parameter("task3_explore_max_angular_z", 0.45)
         self.declare_parameter("task3_corridor_hard_tolerance_pixels", 110.0)
         self.declare_parameter("task3_corridor_soft_tolerance_pixels", 45.0)
+        self.declare_parameter("task3_target_confirm_frames", 3)
+        self.declare_parameter("task3_target_min_confidence", 0.35)
+        self.declare_parameter("task3_target_min_area_ratio", 0.0005)
+        self.declare_parameter("task3_x_multi_depth_topic", "/camera/x_multi_depth_values")
+        self.declare_parameter("task3_parallel_left_depth_index", 5)
+        self.declare_parameter("task3_parallel_right_depth_index", 15)
+        self.declare_parameter("task3_parallel_depth_tolerance_m", 0.05)
+        self.declare_parameter("task3_parallel_align_kp", 1.2)
+        self.declare_parameter("task3_parallel_max_angular_z", 0.18)
         self.declare_parameter("task3_camera_info_topic", "/camera/camera_info")
         self.declare_parameter("task3_depth_topic", "/camera/depth/compressed")
         self.declare_parameter("task3_camera_frame", "camera_link")
@@ -566,7 +575,8 @@ class Task1MissionController(Node):
         self.declare_parameter("task3_camera_cx", 0.0)
         self.declare_parameter("task3_camera_cy", 0.0)
         self.declare_parameter("task3_depth_patch_radius", 3)
-        self.declare_parameter("task3_arm_reach_depth_m", 0.55)
+        self.declare_parameter("task3_approach_stop_depth_m", 0.80)
+        self.declare_parameter("task3_approach_depth_tolerance_m", 0.05)
         self.declare_parameter("task3_align_tolerance_pixels", 22.0)
         self.declare_parameter("task3_visual_pid_kp", 0.006)
         self.declare_parameter("task3_visual_pid_ki", 0.0)
@@ -581,8 +591,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task3_arm_press_knob_positions", [90.0, 170.0, 90.0])
         self.declare_parameter("task3_arm_retract_positions", [180.0, 0.0, 90.0])
         self.declare_parameter("task3_clear_forward_seconds", 5.0)
-        self.declare_parameter("task3_clear_forward_speed", 0.12)
-        self.declare_parameter("task3_clear_wheel_action", "FORWARD_SLOW")
+        self.declare_parameter("task3_clear_forward_speed", 0.5)
         self.declare_parameter("control_period_seconds", 0.1)
         self.declare_parameter("exploration_grid_spacing", 1.2)
         self.declare_parameter("exploration_clearance", 0.35)
@@ -1442,11 +1451,6 @@ class Task1MissionController(Node):
         self.run_task3_after_done = self._bool_param("run_task3_after_done")
         self.task3_direct_start = self._bool_param("task3_direct_start")
         self.task3_target_label = self._string_param("task3_target_label")
-        self.task3_door_pose = self._pose_param("task3_door_pose")
-        self.task3_goal_tolerance = self._double_param("task3_goal_tolerance")
-        self.task3_goal_republish_period = self._double_param(
-            "task3_goal_republish_period_seconds"
-        )
         self.task3_locate_timeout_seconds = self._double_param(
             "task3_locate_timeout_seconds"
         )
@@ -1459,11 +1463,41 @@ class Task1MissionController(Node):
         self.task3_drivable_corridor_timeout = self._double_param(
             "task3_drivable_corridor_timeout_seconds"
         )
+        self.task3_explore_forward_speed = self._double_param(
+            "task3_explore_forward_speed"
+        )
+        self.task3_explore_angular_kp = self._double_param("task3_explore_angular_kp")
+        self.task3_explore_max_angular_z = self._double_param(
+            "task3_explore_max_angular_z"
+        )
         self.task3_corridor_hard_tolerance_pixels = self._double_param(
             "task3_corridor_hard_tolerance_pixels"
         )
         self.task3_corridor_soft_tolerance_pixels = self._double_param(
             "task3_corridor_soft_tolerance_pixels"
+        )
+        self.task3_target_confirm_frames = self._integer_param(
+            "task3_target_confirm_frames"
+        )
+        self.task3_target_min_confidence = self._double_param(
+            "task3_target_min_confidence"
+        )
+        self.task3_target_min_area_ratio = self._double_param(
+            "task3_target_min_area_ratio"
+        )
+        self.task3_x_multi_depth_topic = self._string_param("task3_x_multi_depth_topic")
+        self.task3_parallel_left_depth_index = self._integer_param(
+            "task3_parallel_left_depth_index"
+        )
+        self.task3_parallel_right_depth_index = self._integer_param(
+            "task3_parallel_right_depth_index"
+        )
+        self.task3_parallel_depth_tolerance = self._double_param(
+            "task3_parallel_depth_tolerance_m"
+        )
+        self.task3_parallel_align_kp = self._double_param("task3_parallel_align_kp")
+        self.task3_parallel_max_angular_z = self._double_param(
+            "task3_parallel_max_angular_z"
         )
         self.task3_camera_info_topic = self._string_param("task3_camera_info_topic")
         self.task3_depth_topic = self._string_param("task3_depth_topic")
@@ -1474,7 +1508,12 @@ class Task1MissionController(Node):
         self.task3_camera_cx = self._double_param("task3_camera_cx")
         self.task3_camera_cy = self._double_param("task3_camera_cy")
         self.task3_depth_patch_radius = self._integer_param("task3_depth_patch_radius")
-        self.task3_arm_reach_depth = self._double_param("task3_arm_reach_depth_m")
+        self.task3_approach_stop_depth = self._double_param(
+            "task3_approach_stop_depth_m"
+        )
+        self.task3_approach_depth_tolerance = self._double_param(
+            "task3_approach_depth_tolerance_m"
+        )
         self.task3_align_tolerance_pixels = self._double_param(
             "task3_align_tolerance_pixels"
         )
@@ -1510,7 +1549,6 @@ class Task1MissionController(Node):
             "task3_clear_forward_seconds"
         )
         self.task3_clear_forward_speed = self._double_param("task3_clear_forward_speed")
-        self.task3_clear_wheel_action = self._string_param("task3_clear_wheel_action")
         self.exploration_grid_spacing = self._double_param("exploration_grid_spacing")
         self.exploration_clearance = self._double_param("exploration_clearance")
         self.exploration_min_goal_distance = self._double_param(
@@ -1666,6 +1704,8 @@ class Task1MissionController(Node):
         self.segmentation_info_stamp = None
         self.drivable_corridor_info = None
         self.drivable_corridor_stamp = None
+        self.x_multi_depth_values = []
+        self.x_multi_depth_stamp = None
         self.latest_depth_image = None
         self.latest_depth_stamp = None
         self.latest_depth_frame = ""
@@ -1771,7 +1811,8 @@ class Task1MissionController(Node):
         self.task3_completed = False
         self.task3_phase_start_time = None
         self.task3_observe_start_time = None
-        self.task3_last_goal_publish_time = None
+        self.task3_target_confirm_count = 0
+        self.task3_align_phase = "approach"
         self.task3_visual_pid_integral = 0.0
         self.task3_visual_pid_last_error = None
         self.task3_visual_pid_last_time = None
@@ -1867,7 +1908,7 @@ class Task1MissionController(Node):
         self._init_mission_logging()
 
         if self.task3_direct_start:
-            self.state = MissionState.TASK3_LOCATE_DOOR
+            self.state = MissionState.TASK3_EXPLORE_DOOR
         elif self.mission_mode == "bridge_first_shared_bear":
             self.state = MissionState.TASK2_SEARCH_BRIDGE
         else:
@@ -1980,6 +2021,12 @@ class Task1MissionController(Node):
             CompressedImage,
             self.task3_depth_topic,
             self._task3_depth_callback,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            self.task3_x_multi_depth_topic,
+            self._task3_x_multi_depth_callback,
             10,
         )
         self.create_subscription(
@@ -2452,6 +2499,10 @@ class Task1MissionController(Node):
             return
         if depth_img is not None:
             self.latest_depth_image = depth_img
+
+    def _task3_x_multi_depth_callback(self, msg):
+        self.x_multi_depth_values = [float(value) for value in msg.data]
+        self.x_multi_depth_stamp = self.get_clock().now()
 
     def _segmentation_info_callback(self, msg):
         if len(msg.data) < 10:
@@ -3125,10 +3176,10 @@ class Task1MissionController(Node):
             self._task2_search_bridge_bear()
         elif self.state == MissionState.TASK2_DESCEND_BRIDGE:
             self._task2_descend_bridge()
-        elif self.state == MissionState.TASK3_LOCATE_DOOR:
-            self._task3_locate_door()
-        elif self.state == MissionState.TASK3_OBSERVE_AND_ALIGN:
-            self._task3_observe_and_align()
+        elif self.state == MissionState.TASK3_EXPLORE_DOOR:
+            self._task3_explore_door()
+        elif self.state == MissionState.TASK3_ALIGN_DOOR:
+            self._task3_align_door()
         elif self.state == MissionState.TASK3_UNLOCK_DOOR:
             self._task3_unlock_door()
         elif self.state == MissionState.TASK3_CLEAR_DOOR:
@@ -3764,12 +3815,13 @@ class Task1MissionController(Node):
         self._clear_navigation()
         self._reset_task3_runtime()
         self.get_logger().info("Starting Task 3: Door Unlock and Clear.")
-        self._set_state(MissionState.TASK3_LOCATE_DOOR)
+        self._set_state(MissionState.TASK3_EXPLORE_DOOR)
 
     def _reset_task3_runtime(self):
         self.task3_phase_start_time = None
         self.task3_observe_start_time = None
-        self.task3_last_goal_publish_time = None
+        self.task3_target_confirm_count = 0
+        self.task3_align_phase = "approach"
         self.task3_visual_pid_integral = 0.0
         self.task3_visual_pid_last_error = None
         self.task3_visual_pid_last_time = None
@@ -3781,86 +3833,90 @@ class Task1MissionController(Node):
         self.task3_clear_start_time = None
         self.task3_retract_sent = False
 
-    def _task3_locate_door(self):
+    def _task3_explore_door(self):
         if self.task3_phase_start_time is None:
             self.task3_phase_start_time = self.get_clock().now()
-            self.task3_last_goal_publish_time = None
+            self.task3_target_confirm_count = 0
             self.get_logger().info(
-                "Task 3: navigating toward fixed door pose while following drivable corridor."
+                "Task 3: SLAM-only door exploration using drivable corridor /cmd_vel."
             )
 
-        if self._task3_target_visible():
-            self._publish_action("STOP")
+        if self._task3_target_stable():
             self._publish_cmd_vel(0.0, 0.0)
-            self._clear_navigation()
             self._reset_task3_visual_pid()
-            self._set_state(MissionState.TASK3_OBSERVE_AND_ALIGN)
+            self.task3_align_phase = "approach"
+            self._set_state(MissionState.TASK3_ALIGN_DOOR)
             return
 
-        self._publish_task3_door_goal_if_needed()
         if self._elapsed_seconds(self.task3_phase_start_time) >= self.task3_locate_timeout_seconds:
             self.get_logger().warn(
-                "Task 3: door locate timeout; continuing local visual search near goal."
+                "Task 3: door exploration timeout reached; continuing corridor search."
             )
             self.task3_phase_start_time = self.get_clock().now()
 
-        if distance_2d(self.pose[:2], self.task3_door_pose[:2]) <= self.task3_goal_tolerance:
-            self._publish_action("CLOCKWISE_ROTATION_SLOW")
-            return
+        linear_x, angular_z = self._task3_explore_cmd_vel()
+        self._publish_cmd_vel(linear_x, angular_z)
 
-        self._publish_action(self._task3_locate_drive_action())
-
-    def _task3_observe_and_align(self):
+    def _task3_align_door(self):
         if self.task3_phase_start_time is None:
             self.task3_phase_start_time = self.get_clock().now()
             self.task3_observe_start_time = None
-            self._clear_navigation()
+            self.task3_align_phase = "approach"
             self._reset_task3_visual_pid()
             self.get_logger().info(
-                "Task 3: visual servoing to align with door knob."
+                "Task 3: visual servoing to 0.8m, then aligning parallel to door plane."
             )
 
         if not self._task3_target_visible():
             self.task3_observe_start_time = None
             self._reset_task3_visual_pid()
             self._publish_cmd_vel(0.0, 0.0)
-            self._publish_action("STOP")
             return
 
-        error = self._task3_target_center_error()
-        depth = self._task3_target_depth()
-        angular_z = self._task3_visual_pid_angular_z(error)
-        centered = abs(error) <= self.task3_align_tolerance_pixels
-        close_enough = 0.0 < depth <= self.task3_arm_reach_depth
+        if self.task3_align_phase == "approach":
+            error = self._task3_target_delta_x()
+            depth = self._task3_target_depth()
+            angular_z = self._task3_visual_pid_angular_z(error)
+            at_approach_depth = (
+                0.0 < depth <= self.task3_approach_stop_depth + self.task3_approach_depth_tolerance
+            )
 
-        if not centered:
+            if depth <= 0.0:
+                self._publish_cmd_vel(0.0, 0.0)
+                return
+            if not at_approach_depth:
+                self._publish_cmd_vel(self.task3_visual_servo_forward_speed, angular_z)
+                return
+
+            self._publish_cmd_vel(0.0, 0.0)
+            self._reset_task3_visual_pid()
+            self.task3_align_phase = "parallel"
+            self.task3_observe_start_time = None
+            self.get_logger().info("Task 3: reached 0.8m; starting parallel alignment.")
+            return
+
+        depth_error = self._task3_parallel_depth_error()
+        if depth_error is None:
+            self.task3_observe_start_time = None
+            self._publish_cmd_vel(0.0, 0.0)
+            return
+
+        if abs(depth_error) > self.task3_parallel_depth_tolerance:
+            angular_z = self._task3_parallel_angular_z(depth_error)
             self.task3_observe_start_time = None
             self._publish_cmd_vel(0.0, angular_z)
-            self._publish_action(
-                "CLOCKWISE_ROTATION_SLOW"
-                if error > 0.0
-                else "COUNTERCLOCKWISE_ROTATION_SLOW"
-            )
-            return
-
-        if not close_enough:
-            self.task3_observe_start_time = None
-            self._publish_cmd_vel(self.task3_visual_servo_forward_speed, angular_z)
-            self._publish_action("FORWARD_SLOW")
             return
 
         self._publish_cmd_vel(0.0, 0.0)
-        self._publish_action("STOP")
         if self.task3_observe_start_time is None:
             self.task3_observe_start_time = self.get_clock().now()
-            self.get_logger().info("Task 3: knob observed in arm range; holding still.")
+            self.get_logger().info("Task 3: door plane parallel; holding still.")
             return
         if self._elapsed_seconds(self.task3_observe_start_time) >= self.task3_observe_seconds:
             self._set_state(MissionState.TASK3_UNLOCK_DOOR)
 
     def _task3_unlock_door(self):
         self._publish_cmd_vel(0.0, 0.0)
-        self._publish_action("STOP")
 
         if self.task3_phase_start_time is None:
             self.task3_phase_start_time = self.get_clock().now()
@@ -3916,11 +3972,9 @@ class Task1MissionController(Node):
         elapsed = self._elapsed_seconds(self.task3_clear_start_time)
         if elapsed < self.task3_clear_forward_seconds:
             self._publish_cmd_vel(self.task3_clear_forward_speed, 0.0)
-            self._publish_action(self.task3_clear_wheel_action)
             return
 
         self._publish_cmd_vel(0.0, 0.0)
-        self._publish_action("STOP")
         if not self.task3_retract_sent:
             self._publish_arm_positions(self.task3_arm_retract_positions)
             self.task3_retract_sent = True
@@ -3928,39 +3982,13 @@ class Task1MissionController(Node):
         self.task3_completed = True
         self._set_state(MissionState.DONE, reason="task3 complete")
 
-    def _publish_task3_door_goal_if_needed(self):
-        now = self.get_clock().now()
-        if (
-            self.task3_last_goal_publish_time is not None
-            and self._elapsed_seconds(self.task3_last_goal_publish_time)
-            < self.task3_goal_republish_period
-        ):
-            return
-        self.task3_last_goal_publish_time = now
-        self._publish_goal(self.task3_door_pose)
-
-    def _task3_locate_drive_action(self):
-        corridor_action = self._task3_drivable_corridor_action()
-        if corridor_action is not None:
-            return corridor_action
-
-        road = self._segmentation_segment("road")
-        if road is not None and self.task3_use_drivable_corridor:
-            return self._drivable_follow_action_from_segment(
-                road,
-                prefer_bridge=False,
-                forward_action="FORWARD_SLOW",
-                hard_turn_tolerance=self.task3_corridor_hard_tolerance_pixels,
-            )
-        return self._action_toward_pose(self.task3_door_pose)
-
-    def _task3_drivable_corridor_action(self):
+    def _task3_explore_cmd_vel(self):
         if not self.task3_use_drivable_corridor:
-            return None
+            return self.task3_explore_forward_speed, 0.0
         if self.drivable_corridor_info is None or self.drivable_corridor_stamp is None:
-            return None
+            return 0.0, self.task3_explore_max_angular_z
         if self._elapsed_seconds(self.drivable_corridor_stamp) > self.task3_drivable_corridor_timeout:
-            return None
+            return 0.0, self.task3_explore_max_angular_z
 
         corridor = self.drivable_corridor_info
         if (
@@ -3968,32 +3996,67 @@ class Task1MissionController(Node):
             or not corridor.get("bottom_connected", False)
             or corridor.get("side_view_likely", False)
         ):
-            return self._reacquire_drivable_action(None)
+            return 0.0, self.task3_explore_max_angular_z
 
         error = float(corridor.get("error_x", 0.0))
-        self._remember_drivable_direction(error)
-        if abs(error) > self.task3_corridor_hard_tolerance_pixels:
-            return (
-                "CLOCKWISE_ROTATION_SLOW"
-                if error > 0.0
-                else "COUNTERCLOCKWISE_ROTATION_SLOW"
-            )
-        if abs(error) > self.task3_corridor_soft_tolerance_pixels:
-            return "RIGHT_FRONT" if error > 0.0 else "LEFT_FRONT"
-        return "FORWARD_SLOW"
+        angular_z = -self.task3_explore_angular_kp * error
+        angular_z = self._clamp(
+            angular_z,
+            -self.task3_explore_max_angular_z,
+            self.task3_explore_max_angular_z,
+        )
+        return self.task3_explore_forward_speed, angular_z
 
     def _task3_target_visible(self):
         return self._target_visible() and self._bbox_visible()
 
-    def _task3_target_center_error(self):
+    def _task3_target_stable(self):
+        if self._task3_target_visible() and self._task3_target_quality_ok():
+            self.task3_target_confirm_count += 1
+        else:
+            self.task3_target_confirm_count = 0
+        return self.task3_target_confirm_count >= self.task3_target_confirm_frames
+
+    def _task3_target_quality_ok(self):
         bbox = self.yolo_bbox or {}
-        image_width = float(bbox.get("image_width", 0.0))
-        if image_width <= 0.0:
-            image_width = self._segmentation_image_width()
-        center_x = float(bbox.get("center_x", 0.0))
-        if image_width <= 0.0 or center_x <= 0.0:
-            return float((self.yolo_target or {}).get("delta_x", 0.0))
-        return center_x - image_width * 0.5
+        confidence = float(bbox.get("confidence", 0.0))
+        area_ratio = float(bbox.get("area_ratio", 0.0))
+        return (
+            confidence >= self.task3_target_min_confidence
+            and area_ratio >= self.task3_target_min_area_ratio
+        )
+
+    def _task3_target_delta_x(self):
+        return float((self.yolo_target or {}).get("delta_x", 0.0))
+
+    def _task3_parallel_depth_error(self):
+        if self.x_multi_depth_stamp is None:
+            return None
+        if self._elapsed_seconds(self.x_multi_depth_stamp) > self.target_timeout:
+            return None
+        values = self.x_multi_depth_values
+        left_index = self.task3_parallel_left_depth_index
+        right_index = self.task3_parallel_right_depth_index
+        if left_index < 0 or right_index < 0:
+            return None
+        if left_index >= len(values) or right_index >= len(values):
+            return None
+        left_depth = float(values[left_index])
+        right_depth = float(values[right_index])
+        if left_depth <= 0.0 or right_depth <= 0.0:
+            return None
+        return left_depth - right_depth
+
+    def _task3_parallel_angular_z(self, depth_error):
+        angular_z = self.task3_parallel_align_kp * depth_error
+        return self._clamp(
+            angular_z,
+            -self.task3_parallel_max_angular_z,
+            self.task3_parallel_max_angular_z,
+        )
+
+    def _clamp(self, value, low, high):
+        return max(low, min(high, value))
 
     def _reset_task3_visual_pid(self):
         self.task3_visual_pid_integral = 0.0
@@ -4030,14 +4093,14 @@ class Task1MissionController(Node):
         return -command
 
     def _task3_target_depth(self):
-        depth = self._task3_depth_at_target_bbox()
+        depth = float((self.yolo_target or {}).get("distance", 0.0))
         if depth > 0.0:
             return depth
         bbox = self.yolo_bbox or {}
         depth = float(bbox.get("distance", 0.0))
         if depth > 0.0:
             return depth
-        return float((self.yolo_target or {}).get("distance", 0.0))
+        return self._task3_depth_at_target_bbox()
 
     def _task3_depth_at_target_bbox(self):
         if self.latest_depth_image is None or self.latest_depth_stamp is None:
@@ -6930,8 +6993,8 @@ class Task1MissionController(Node):
     def _state_is_task3(self, state=None):
         state = self.state if state is None else state
         return state in (
-            MissionState.TASK3_LOCATE_DOOR,
-            MissionState.TASK3_OBSERVE_AND_ALIGN,
+            MissionState.TASK3_EXPLORE_DOOR,
+            MissionState.TASK3_ALIGN_DOOR,
             MissionState.TASK3_UNLOCK_DOOR,
             MissionState.TASK3_CLEAR_DOOR,
         )
@@ -6947,7 +7010,7 @@ class Task1MissionController(Node):
             MissionState.TASK2_ASCEND_BRIDGE,
             MissionState.TASK2_SEARCH_BRIDGE_BEAR,
             MissionState.TASK2_DESCEND_BRIDGE,
-            MissionState.TASK3_LOCATE_DOOR,
+            MissionState.TASK3_EXPLORE_DOOR,
         )
 
     def _preferred_drivable_segment(self, prefer_bridge=False):
@@ -7574,8 +7637,8 @@ class Task1MissionController(Node):
             MissionState.VERIFY_GRAB,
             MissionState.RETURN_START,
             MissionState.DROP_BEAR,
-            MissionState.TASK3_LOCATE_DOOR,
-            MissionState.TASK3_OBSERVE_AND_ALIGN,
+            MissionState.TASK3_EXPLORE_DOOR,
+            MissionState.TASK3_ALIGN_DOOR,
             MissionState.TASK3_UNLOCK_DOOR,
             MissionState.TASK3_CLEAR_DOOR,
         ):
@@ -9054,9 +9117,9 @@ class Task1MissionController(Node):
         if self._state_is_task3(state):
             self.current_task = 3
             self.task3_phase_start_time = None
-        if state == MissionState.TASK3_LOCATE_DOOR:
+        if state == MissionState.TASK3_EXPLORE_DOOR:
             self._reset_task3_runtime()
-        if state == MissionState.TASK3_OBSERVE_AND_ALIGN:
+        if state == MissionState.TASK3_ALIGN_DOOR:
             self.task3_observe_start_time = None
             self._reset_task3_visual_pid()
             self._clear_navigation()
@@ -9072,7 +9135,7 @@ class Task1MissionController(Node):
             self.task3_retract_sent = False
             self._clear_navigation()
         if old_state in (
-            MissionState.TASK3_OBSERVE_AND_ALIGN,
+            MissionState.TASK3_ALIGN_DOOR,
             MissionState.TASK3_CLEAR_DOOR,
         ) and not self._state_is_task3(state):
             self._publish_cmd_vel(0.0, 0.0)

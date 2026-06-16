@@ -11,9 +11,9 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros import Buffer, TransformListener
-from geometry_msgs.msg import Point, PointStamped, PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import Point, PointStamped, PoseStamped, PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2
 from std_msgs.msg import Float32MultiArray, String
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
@@ -25,6 +25,18 @@ try:
     from sensor_msgs_py import point_cloud2
 except Exception:
     point_cloud2 = None
+
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
+
+try:
+    from tf2_geometry_msgs import do_transform_point
+except Exception:
+    do_transform_point = None
 
 
 class MissionState(str, Enum):
@@ -48,6 +60,10 @@ class MissionState(str, Enum):
     TASK2_ASCEND_BRIDGE = "task2_ascent"
     TASK2_SEARCH_BRIDGE_BEAR = "task2_search_bridge_bear"
     TASK2_DESCEND_BRIDGE = "task2_descent"
+    TASK3_LOCATE_DOOR = "task3_locate_door"
+    TASK3_OBSERVE_AND_ALIGN = "task3_observe_and_align"
+    TASK3_UNLOCK_DOOR = "task3_unlock_door"
+    TASK3_CLEAR_DOOR = "task3_clear_door"
     DONE = "done"
 
 
@@ -264,20 +280,20 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_bridge_top_pose", [0.0, 0.0, 0.0])
         self.declare_parameter("task2_use_bridge_exit_pose", False)
         self.declare_parameter("task2_bridge_exit_pose", [0.0, 0.0, 0.0])
-        self.declare_parameter("task2_ascent_min_seconds", 8.0)
+        self.declare_parameter("task2_ascent_min_seconds", 15.0)
         self.declare_parameter("task2_ascent_timeout_seconds", 20.0)
         self.declare_parameter("task2_ascent_action", "ASCEND_FORWARD")
-        self.declare_parameter("task2_ascent_forward_speed_scale", 1.25)
+        self.declare_parameter("task2_ascent_forward_speed_scale", 2.0)
         self.declare_parameter("task2_ascent_require_top_confidence", True)
         self.declare_parameter("task2_ascent_continue_if_not_top", True)
         self.declare_parameter("task2_ascent_max_extra_seconds", 4.0)
         self.declare_parameter("task2_ascent_centering_enabled", True)
         self.declare_parameter("task2_ascent_stop_on_bridge_loss_seconds", 10.0) #*
-        self.declare_parameter("task2_ascent_bear_pid_enabled", True)
+        self.declare_parameter("task2_ascent_bear_pid_enabled", False)
         self.declare_parameter("task2_ascent_bear_pid_center_tolerance_pixels", 105.0)
         self.declare_parameter("task2_ascent_bear_pid_kp", 1.5)
-        self.declare_parameter("task2_ascent_bear_pid_ki", 0.0)
-        self.declare_parameter("task2_ascent_bear_pid_kd", 0.05)
+        self.declare_parameter("task2_ascent_bear_pid_ki", 0.1)
+        self.declare_parameter("task2_ascent_bear_pid_kd", 0.1)
         self.declare_parameter("task2_ascent_bear_pid_integral_limit", 200.0)
         self.declare_parameter("task2_ascent_bear_pid_max_turn", 340.0)
         self.declare_parameter("task2_ascent_bear_pid_rotate_only_pixels", 150.0)
@@ -326,7 +342,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_bridge_orbit_forward_seconds", 1.2)
         self.declare_parameter("task2_bridge_orbit_turn_seconds", 2.0) #*
         self.declare_parameter("task2_bridge_orbit_max_cycles", 5)
-        self.declare_parameter("task2_bridge_lost_grace_seconds", 0.6)
+        self.declare_parameter("task2_bridge_lost_grace_seconds", 0.6) #*
         self.declare_parameter("task2_bridge_tracking_loss_grace_seconds", 1.2)
         self.declare_parameter("task2_bridge_tracking_expire_seconds", 3.0)
         self.declare_parameter("task2_bridge_fresh_required_for_transition", True)
@@ -408,7 +424,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_bridge_corridor_side_margin_pixels", 30.0)
         self.declare_parameter("task2_bridge_corridor_center_tolerance", 25.0)
         self.declare_parameter("task2_bridge_corridor_hard_tolerance", 75.0)
-        self.declare_parameter("task2_bridge_corridor_loss_grace_seconds", 0.5)
+        self.declare_parameter("task2_bridge_corridor_loss_grace_seconds", 1.5) #*
         self.declare_parameter("task2_turn_visual_deadband_pixels", 25.0)
         self.declare_parameter("task2_turn_visual_coarse_pixels", 90.0)
         self.declare_parameter("task2_turn_map_yaw_tolerance_deg", 8.0)
@@ -421,6 +437,9 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_turn_wrong_way_limit", 2)
         self.declare_parameter("task2_turn_direction_sign", 1.0)
         self.declare_parameter("task2_turn_auto_flip_enabled", True)
+        self.declare_parameter("task2_turn_stop_recovery_enabled", True)
+        self.declare_parameter("task2_turn_stop_recovery_seconds", 2.5) #*
+        self.declare_parameter("task2_turn_stop_recovery_min_state_seconds", 1.0)
         self.declare_parameter("task2_turn_allow_frontal_bridge_ascent", True)
         self.declare_parameter("task2_turn_frontal_bridge_min_frontalness", 0.82)
         self.declare_parameter("task2_turn_frontal_bridge_min_confidence", 0.80)
@@ -486,8 +505,8 @@ class Task1MissionController(Node):
         self.declare_parameter("task_return_budget_seconds", 90.0)
         self.declare_parameter("task2_top_search_rotate_seconds", 8.0)
         self.declare_parameter("task2_top_search_reverse_recenter_seconds", 0.6)
-        self.declare_parameter("task2_top_search_max_forward_seconds", 0.0)
-        self.declare_parameter("task2_top_search_allow_forward", False)
+        self.declare_parameter("task2_top_search_max_forward_seconds", 5.0)
+        self.declare_parameter("task2_top_search_allow_forward", True) #*
         self.declare_parameter("task2_top_search_timeout_seconds", 60.0)
         self.declare_parameter("task2_ascent_stop_settle_seconds", 0.8)
         self.declare_parameter("task2_require_bear_secured_before_descent", True)
@@ -514,7 +533,7 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_ramp_entry_max_side_view_score", 0.45)
         self.declare_parameter("task2_top_use_tf_z", True)
         self.declare_parameter("task2_top_z_threshold_m", 0.18)
-        self.declare_parameter("task2_top_min_ascent_seconds", 7.0)
+        self.declare_parameter("task2_top_min_ascent_seconds", 10.0)
         self.declare_parameter("task2_top_confirm_frames", 5)
         self.declare_parameter("task2_top_visual_confidence_threshold", 0.55)
         self.declare_parameter("task2_bridge_bear_memory_ttl_seconds", 12.0)
@@ -526,6 +545,44 @@ class Task1MissionController(Node):
         self.declare_parameter("task2_top_search_use_cached_bear_direction", True)
         self.declare_parameter("task2_top_search_allow_short_recenter", True)
         self.declare_parameter("task2_top_search_short_recenter_seconds", 0.3)
+        self.declare_parameter("run_task3_after_done", True)
+        self.declare_parameter("task3_direct_start", False)
+        self.declare_parameter("task3_target_label", "door_knob")
+        self.declare_parameter("task3_door_pose", [0.0, 0.0, 0.0])
+        self.declare_parameter("task3_goal_tolerance", 0.65)
+        self.declare_parameter("task3_goal_republish_period_seconds", 1.0)
+        self.declare_parameter("task3_locate_timeout_seconds", 60.0)
+        self.declare_parameter("task3_use_drivable_corridor", True)
+        self.declare_parameter("task3_drivable_corridor_topic", "/yolo/drivable_corridor_info")
+        self.declare_parameter("task3_drivable_corridor_timeout_seconds", 0.5)
+        self.declare_parameter("task3_corridor_hard_tolerance_pixels", 110.0)
+        self.declare_parameter("task3_corridor_soft_tolerance_pixels", 45.0)
+        self.declare_parameter("task3_camera_info_topic", "/camera/camera_info")
+        self.declare_parameter("task3_depth_topic", "/camera/depth/compressed")
+        self.declare_parameter("task3_camera_frame", "camera_link")
+        self.declare_parameter("task3_arm_base_frame", "arm_ik_base")
+        self.declare_parameter("task3_camera_fx", 0.0)
+        self.declare_parameter("task3_camera_fy", 0.0)
+        self.declare_parameter("task3_camera_cx", 0.0)
+        self.declare_parameter("task3_camera_cy", 0.0)
+        self.declare_parameter("task3_depth_patch_radius", 3)
+        self.declare_parameter("task3_arm_reach_depth_m", 0.55)
+        self.declare_parameter("task3_align_tolerance_pixels", 22.0)
+        self.declare_parameter("task3_visual_pid_kp", 0.006)
+        self.declare_parameter("task3_visual_pid_ki", 0.0)
+        self.declare_parameter("task3_visual_pid_kd", 0.001)
+        self.declare_parameter("task3_visual_pid_integral_limit", 250.0)
+        self.declare_parameter("task3_visual_pid_max_angular_z", 0.55)
+        self.declare_parameter("task3_visual_servo_forward_speed", 0.08)
+        self.declare_parameter("task3_observe_seconds", 5.0)
+        self.declare_parameter("task3_unlock_step_hold_seconds", [0.6, 0.8, 1.0])
+        self.declare_parameter("task3_arm_fold_positions", [180.0, 0.0, 90.0])
+        self.declare_parameter("task3_arm_above_knob_positions", [90.0, 120.0, 90.0])
+        self.declare_parameter("task3_arm_press_knob_positions", [90.0, 170.0, 90.0])
+        self.declare_parameter("task3_arm_retract_positions", [180.0, 0.0, 90.0])
+        self.declare_parameter("task3_clear_forward_seconds", 5.0)
+        self.declare_parameter("task3_clear_forward_speed", 0.12)
+        self.declare_parameter("task3_clear_wheel_action", "FORWARD_SLOW")
         self.declare_parameter("control_period_seconds", 0.1)
         self.declare_parameter("exploration_grid_spacing", 1.2)
         self.declare_parameter("exploration_clearance", 0.35)
@@ -1080,6 +1137,15 @@ class Task1MissionController(Node):
         self.task2_turn_auto_flip_enabled = self._bool_param(
             "task2_turn_auto_flip_enabled"
         )
+        self.task2_turn_stop_recovery_enabled = self._bool_param(
+            "task2_turn_stop_recovery_enabled"
+        )
+        self.task2_turn_stop_recovery_seconds = self._double_param(
+            "task2_turn_stop_recovery_seconds"
+        )
+        self.task2_turn_stop_recovery_min_state_seconds = self._double_param(
+            "task2_turn_stop_recovery_min_state_seconds"
+        )
         self.task2_turn_allow_frontal_bridge_ascent = self._bool_param(
             "task2_turn_allow_frontal_bridge_ascent"
         )
@@ -1373,6 +1439,78 @@ class Task1MissionController(Node):
         self.task2_top_search_short_recenter_seconds = self._double_param(
             "task2_top_search_short_recenter_seconds"
         )
+        self.run_task3_after_done = self._bool_param("run_task3_after_done")
+        self.task3_direct_start = self._bool_param("task3_direct_start")
+        self.task3_target_label = self._string_param("task3_target_label")
+        self.task3_door_pose = self._pose_param("task3_door_pose")
+        self.task3_goal_tolerance = self._double_param("task3_goal_tolerance")
+        self.task3_goal_republish_period = self._double_param(
+            "task3_goal_republish_period_seconds"
+        )
+        self.task3_locate_timeout_seconds = self._double_param(
+            "task3_locate_timeout_seconds"
+        )
+        self.task3_use_drivable_corridor = self._bool_param(
+            "task3_use_drivable_corridor"
+        )
+        self.task3_drivable_corridor_topic = self._string_param(
+            "task3_drivable_corridor_topic"
+        )
+        self.task3_drivable_corridor_timeout = self._double_param(
+            "task3_drivable_corridor_timeout_seconds"
+        )
+        self.task3_corridor_hard_tolerance_pixels = self._double_param(
+            "task3_corridor_hard_tolerance_pixels"
+        )
+        self.task3_corridor_soft_tolerance_pixels = self._double_param(
+            "task3_corridor_soft_tolerance_pixels"
+        )
+        self.task3_camera_info_topic = self._string_param("task3_camera_info_topic")
+        self.task3_depth_topic = self._string_param("task3_depth_topic")
+        self.task3_camera_frame = self._string_param("task3_camera_frame")
+        self.task3_arm_base_frame = self._string_param("task3_arm_base_frame")
+        self.task3_camera_fx = self._double_param("task3_camera_fx")
+        self.task3_camera_fy = self._double_param("task3_camera_fy")
+        self.task3_camera_cx = self._double_param("task3_camera_cx")
+        self.task3_camera_cy = self._double_param("task3_camera_cy")
+        self.task3_depth_patch_radius = self._integer_param("task3_depth_patch_radius")
+        self.task3_arm_reach_depth = self._double_param("task3_arm_reach_depth_m")
+        self.task3_align_tolerance_pixels = self._double_param(
+            "task3_align_tolerance_pixels"
+        )
+        self.task3_visual_pid_kp = self._double_param("task3_visual_pid_kp")
+        self.task3_visual_pid_ki = self._double_param("task3_visual_pid_ki")
+        self.task3_visual_pid_kd = self._double_param("task3_visual_pid_kd")
+        self.task3_visual_pid_integral_limit = self._double_param(
+            "task3_visual_pid_integral_limit"
+        )
+        self.task3_visual_pid_max_angular_z = self._double_param(
+            "task3_visual_pid_max_angular_z"
+        )
+        self.task3_visual_servo_forward_speed = self._double_param(
+            "task3_visual_servo_forward_speed"
+        )
+        self.task3_observe_seconds = self._double_param("task3_observe_seconds")
+        self.task3_unlock_step_hold_seconds = self._double_array_param(
+            "task3_unlock_step_hold_seconds"
+        )
+        self.task3_arm_fold_positions = self._double_array_param(
+            "task3_arm_fold_positions"
+        )
+        self.task3_arm_above_knob_positions = self._double_array_param(
+            "task3_arm_above_knob_positions"
+        )
+        self.task3_arm_press_knob_positions = self._double_array_param(
+            "task3_arm_press_knob_positions"
+        )
+        self.task3_arm_retract_positions = self._double_array_param(
+            "task3_arm_retract_positions"
+        )
+        self.task3_clear_forward_seconds = self._double_param(
+            "task3_clear_forward_seconds"
+        )
+        self.task3_clear_forward_speed = self._double_param("task3_clear_forward_speed")
+        self.task3_clear_wheel_action = self._string_param("task3_clear_wheel_action")
         self.exploration_grid_spacing = self._double_param("exploration_grid_spacing")
         self.exploration_clearance = self._double_param("exploration_clearance")
         self.exploration_min_goal_distance = self._double_param(
@@ -1526,6 +1664,14 @@ class Task1MissionController(Node):
         self.target_surface_stamp = None
         self.segmentation_info = None
         self.segmentation_info_stamp = None
+        self.drivable_corridor_info = None
+        self.drivable_corridor_stamp = None
+        self.latest_depth_image = None
+        self.latest_depth_stamp = None
+        self.latest_depth_frame = ""
+        self.camera_info = None
+        self.camera_info_stamp = None
+        self.camera_frame = self.task3_camera_frame
         self.segmentation_connection = None
         self.segmentation_last_seen = {"road": None, "bridge": None}
         self.last_drivable_action = None
@@ -1540,7 +1686,9 @@ class Task1MissionController(Node):
         self.bear_secured = False
         self.bear_context = None
         self.current_task = (
-            2 if self.mission_mode == "bridge_first_shared_bear" else 1
+            3
+            if self.task3_direct_start
+            else 2 if self.mission_mode == "bridge_first_shared_bear" else 1
         )
         self.next_state_after_grab = (
             MissionState.TASK2_DESCEND_BRIDGE
@@ -1618,6 +1766,22 @@ class Task1MissionController(Node):
         self.task2_turn_centered_frames = 0
         self.task2_turn_last_observed_error = None
         self.task2_turn_sign_confirmed = False
+        self.task2_turn_stop_start_time = None
+        self.task2_turn_last_stop_reason = ""
+        self.task3_completed = False
+        self.task3_phase_start_time = None
+        self.task3_observe_start_time = None
+        self.task3_last_goal_publish_time = None
+        self.task3_visual_pid_integral = 0.0
+        self.task3_visual_pid_last_error = None
+        self.task3_visual_pid_last_time = None
+        self.task3_knob_camera_point = None
+        self.task3_knob_map_point = None
+        self.task3_knob_arm_point = None
+        self.task3_unlock_step_index = 0
+        self.task3_unlock_step_start_time = None
+        self.task3_clear_start_time = None
+        self.task3_retract_sent = False
         self.task2_entry_close_confirm_count = 0
         self.task2_entry_close_last_reason = ""
         self.task2_entry_blocked_count = 0
@@ -1702,7 +1866,9 @@ class Task1MissionController(Node):
         self.mission_jsonl_file = None
         self._init_mission_logging()
 
-        if self.mission_mode == "bridge_first_shared_bear":
+        if self.task3_direct_start:
+            self.state = MissionState.TASK3_LOCATE_DOOR
+        elif self.mission_mode == "bridge_first_shared_bear":
             self.state = MissionState.TASK2_SEARCH_BRIDGE
         else:
             self.state = (
@@ -1714,6 +1880,7 @@ class Task1MissionController(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", 10
         )
@@ -1754,6 +1921,9 @@ class Task1MissionController(Node):
         self.bridge_geometry_quality_pub = self.create_publisher(
             String, "/task_mission/bridge_geometry_quality", 10
         )
+        self.task3_knob_arm_point_pub = self.create_publisher(
+            PointStamped, "/task_mission/task3_knob_arm_point", 10
+        )
 
         self.create_subscription(
             PoseWithCovarianceStamped,
@@ -1792,6 +1962,24 @@ class Task1MissionController(Node):
             Float32MultiArray,
             "/yolo/segmentation_info",
             self._segmentation_info_callback,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            self.task3_drivable_corridor_topic,
+            self._drivable_corridor_callback,
+            10,
+        )
+        self.create_subscription(
+            CameraInfo,
+            self.task3_camera_info_topic,
+            self._task3_camera_info_callback,
+            10,
+        )
+        self.create_subscription(
+            CompressedImage,
+            self.task3_depth_topic,
+            self._task3_depth_callback,
             10,
         )
         self.create_subscription(
@@ -2030,6 +2218,7 @@ class Task1MissionController(Node):
             task2_ascent_completed=self.task2_ascent_completed,
             task2_descent_completed=self.task2_descent_completed,
             task2_recovery_completed=self.task2_recovery_completed,
+            task3_completed=self.task3_completed,
             bear_secured=self.bear_secured,
             elapsed_seconds=self._elapsed_seconds(self.mission_start_time),
             log_path=self.mission_log_path,
@@ -2203,6 +2392,66 @@ class Task1MissionController(Node):
             ),
         }
         self.target_surface_stamp = self.get_clock().now()
+
+    def _drivable_corridor_callback(self, msg):
+        if len(msg.data) < 19:
+            return
+        self.drivable_corridor_info = {
+            "valid": msg.data[0] >= 0.5,
+            "bottom_connected": msg.data[1] >= 0.5,
+            "centerline_reached": msg.data[2] >= 0.5,
+            "upper_mid_reached": msg.data[3] >= 0.5,
+            "continuous_score": float(msg.data[4]),
+            "bottom_width_ratio": float(msg.data[5]),
+            "center_width_ratio": float(msg.data[6]),
+            "bottom_center_x": float(msg.data[7]),
+            "mid_center_x": float(msg.data[8]),
+            "centerline_x": float(msg.data[9]),
+            "error_x": float(msg.data[10]),
+            "slope_pixels": float(msg.data[11]),
+            "road_ratio": float(msg.data[12]),
+            "bridge_ratio": float(msg.data[13]),
+            "drivable_type": float(msg.data[14]),
+            "side_view_likely": msg.data[15] >= 0.5,
+            "image_width": float(msg.data[16]),
+            "image_height": float(msg.data[17]),
+            "reason_code": float(msg.data[18]),
+        }
+        self.drivable_corridor_stamp = self.get_clock().now()
+
+    def _task3_camera_info_callback(self, msg):
+        self.camera_info = msg
+        self.camera_info_stamp = self.get_clock().now()
+        frame_id = getattr(getattr(msg, "header", None), "frame_id", "")
+        if frame_id:
+            self.camera_frame = frame_id
+        k = getattr(msg, "k", None)
+        if k is None or len(k) < 6:
+            return
+        if float(k[0]) > 0.0:
+            self.task3_camera_fx = float(k[0])
+        if float(k[4]) > 0.0:
+            self.task3_camera_fy = float(k[4])
+        if float(k[2]) > 0.0:
+            self.task3_camera_cx = float(k[2])
+        if float(k[5]) > 0.0:
+            self.task3_camera_cy = float(k[5])
+
+    def _task3_depth_callback(self, msg):
+        frame_id = getattr(getattr(msg, "header", None), "frame_id", "")
+        if frame_id:
+            self.latest_depth_frame = frame_id
+        self.latest_depth_stamp = self.get_clock().now()
+        if cv2 is None or np is None:
+            return
+        try:
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            depth_img = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
+        except Exception as exc:
+            self.get_logger().warn(f"Could not decode Task 3 compressed depth: {exc}")
+            return
+        if depth_img is not None:
+            self.latest_depth_image = depth_img
 
     def _segmentation_info_callback(self, msg):
         if len(msg.data) < 10:
@@ -2816,6 +3065,7 @@ class Task1MissionController(Node):
 
         if self.pose is None:
             self._publish_action("STOP")
+            self._publish_cmd_vel(0.0, 0.0)
             self._log_waiting_for_pose()
             return
 
@@ -2875,8 +3125,20 @@ class Task1MissionController(Node):
             self._task2_search_bridge_bear()
         elif self.state == MissionState.TASK2_DESCEND_BRIDGE:
             self._task2_descend_bridge()
+        elif self.state == MissionState.TASK3_LOCATE_DOOR:
+            self._task3_locate_door()
+        elif self.state == MissionState.TASK3_OBSERVE_AND_ALIGN:
+            self._task3_observe_and_align()
+        elif self.state == MissionState.TASK3_UNLOCK_DOOR:
+            self._task3_unlock_door()
+        elif self.state == MissionState.TASK3_CLEAR_DOOR:
+            self._task3_clear_door()
         elif self.state == MissionState.DONE:
+            if self._should_start_task3_from_done():
+                self._start_task3()
+                return
             self._publish_action("STOP")
+            self._publish_cmd_vel(0.0, 0.0)
 
     def _navigate_state(self, goal_name, goal, next_state):
         if self.state == MissionState.RETURN_START and not self._check_return_hold():
@@ -3492,6 +3754,448 @@ class Task1MissionController(Node):
         self.get_logger().info("Starting Task 2 after Task 1 completion.")
         self._set_state(MissionState.TASK2_SEARCH_BRIDGE)
 
+    def _should_start_task3_from_done(self):
+        return self.run_task3_after_done and not self.task3_completed
+
+    def _start_task3(self):
+        self.current_task = 3
+        self._publish_action("STOP")
+        self._publish_cmd_vel(0.0, 0.0)
+        self._clear_navigation()
+        self._reset_task3_runtime()
+        self.get_logger().info("Starting Task 3: Door Unlock and Clear.")
+        self._set_state(MissionState.TASK3_LOCATE_DOOR)
+
+    def _reset_task3_runtime(self):
+        self.task3_phase_start_time = None
+        self.task3_observe_start_time = None
+        self.task3_last_goal_publish_time = None
+        self.task3_visual_pid_integral = 0.0
+        self.task3_visual_pid_last_error = None
+        self.task3_visual_pid_last_time = None
+        self.task3_knob_camera_point = None
+        self.task3_knob_map_point = None
+        self.task3_knob_arm_point = None
+        self.task3_unlock_step_index = 0
+        self.task3_unlock_step_start_time = None
+        self.task3_clear_start_time = None
+        self.task3_retract_sent = False
+
+    def _task3_locate_door(self):
+        if self.task3_phase_start_time is None:
+            self.task3_phase_start_time = self.get_clock().now()
+            self.task3_last_goal_publish_time = None
+            self.get_logger().info(
+                "Task 3: navigating toward fixed door pose while following drivable corridor."
+            )
+
+        if self._task3_target_visible():
+            self._publish_action("STOP")
+            self._publish_cmd_vel(0.0, 0.0)
+            self._clear_navigation()
+            self._reset_task3_visual_pid()
+            self._set_state(MissionState.TASK3_OBSERVE_AND_ALIGN)
+            return
+
+        self._publish_task3_door_goal_if_needed()
+        if self._elapsed_seconds(self.task3_phase_start_time) >= self.task3_locate_timeout_seconds:
+            self.get_logger().warn(
+                "Task 3: door locate timeout; continuing local visual search near goal."
+            )
+            self.task3_phase_start_time = self.get_clock().now()
+
+        if distance_2d(self.pose[:2], self.task3_door_pose[:2]) <= self.task3_goal_tolerance:
+            self._publish_action("CLOCKWISE_ROTATION_SLOW")
+            return
+
+        self._publish_action(self._task3_locate_drive_action())
+
+    def _task3_observe_and_align(self):
+        if self.task3_phase_start_time is None:
+            self.task3_phase_start_time = self.get_clock().now()
+            self.task3_observe_start_time = None
+            self._clear_navigation()
+            self._reset_task3_visual_pid()
+            self.get_logger().info(
+                "Task 3: visual servoing to align with door knob."
+            )
+
+        if not self._task3_target_visible():
+            self.task3_observe_start_time = None
+            self._reset_task3_visual_pid()
+            self._publish_cmd_vel(0.0, 0.0)
+            self._publish_action("STOP")
+            return
+
+        error = self._task3_target_center_error()
+        depth = self._task3_target_depth()
+        angular_z = self._task3_visual_pid_angular_z(error)
+        centered = abs(error) <= self.task3_align_tolerance_pixels
+        close_enough = 0.0 < depth <= self.task3_arm_reach_depth
+
+        if not centered:
+            self.task3_observe_start_time = None
+            self._publish_cmd_vel(0.0, angular_z)
+            self._publish_action(
+                "CLOCKWISE_ROTATION_SLOW"
+                if error > 0.0
+                else "COUNTERCLOCKWISE_ROTATION_SLOW"
+            )
+            return
+
+        if not close_enough:
+            self.task3_observe_start_time = None
+            self._publish_cmd_vel(self.task3_visual_servo_forward_speed, angular_z)
+            self._publish_action("FORWARD_SLOW")
+            return
+
+        self._publish_cmd_vel(0.0, 0.0)
+        self._publish_action("STOP")
+        if self.task3_observe_start_time is None:
+            self.task3_observe_start_time = self.get_clock().now()
+            self.get_logger().info("Task 3: knob observed in arm range; holding still.")
+            return
+        if self._elapsed_seconds(self.task3_observe_start_time) >= self.task3_observe_seconds:
+            self._set_state(MissionState.TASK3_UNLOCK_DOOR)
+
+    def _task3_unlock_door(self):
+        self._publish_cmd_vel(0.0, 0.0)
+        self._publish_action("STOP")
+
+        if self.task3_phase_start_time is None:
+            self.task3_phase_start_time = self.get_clock().now()
+            self.task3_unlock_step_index = 0
+            self.task3_unlock_step_start_time = None
+            self.task3_knob_camera_point = None
+            self.task3_knob_map_point = None
+            self.task3_knob_arm_point = None
+            self.get_logger().info("Task 3: computing live knob point for arm push.")
+
+        if self.task3_knob_arm_point is None:
+            arm_point = self._task3_update_knob_arm_point()
+            if arm_point is None:
+                return
+            self.task3_knob_arm_point = arm_point
+            self.get_logger().info(
+                "Task 3 knob in arm base: "
+                f"x={arm_point.point.x:.3f}, y={arm_point.point.y:.3f}, "
+                f"z={arm_point.point.z:.3f}."
+            )
+
+        sequence = [
+            self.task3_arm_fold_positions,
+            self.task3_arm_above_knob_positions,
+            self.task3_arm_press_knob_positions,
+        ]
+        if self.task3_unlock_step_index >= len(sequence):
+            self._set_state(MissionState.TASK3_CLEAR_DOOR)
+            return
+
+        now = self.get_clock().now()
+        if self.task3_unlock_step_start_time is None:
+            positions = self._task3_arm_positions_for_step(
+                self.task3_unlock_step_index, self.task3_knob_arm_point
+            )
+            self._publish_arm_positions(positions)
+            self.task3_unlock_step_start_time = now
+            return
+
+        hold_seconds = self._task3_unlock_step_hold(self.task3_unlock_step_index)
+        if self._elapsed_seconds(self.task3_unlock_step_start_time) >= hold_seconds:
+            self.task3_unlock_step_index += 1
+            self.task3_unlock_step_start_time = None
+
+    def _task3_clear_door(self):
+        if self.task3_clear_start_time is None:
+            self.task3_clear_start_time = self.get_clock().now()
+            self.task3_retract_sent = False
+            self.get_logger().info(
+                "Task 3: pushing door open with continuous /cmd_vel forward motion."
+            )
+
+        elapsed = self._elapsed_seconds(self.task3_clear_start_time)
+        if elapsed < self.task3_clear_forward_seconds:
+            self._publish_cmd_vel(self.task3_clear_forward_speed, 0.0)
+            self._publish_action(self.task3_clear_wheel_action)
+            return
+
+        self._publish_cmd_vel(0.0, 0.0)
+        self._publish_action("STOP")
+        if not self.task3_retract_sent:
+            self._publish_arm_positions(self.task3_arm_retract_positions)
+            self.task3_retract_sent = True
+            self.get_logger().info("Task 3: door cleared; retracting arm.")
+        self.task3_completed = True
+        self._set_state(MissionState.DONE, reason="task3 complete")
+
+    def _publish_task3_door_goal_if_needed(self):
+        now = self.get_clock().now()
+        if (
+            self.task3_last_goal_publish_time is not None
+            and self._elapsed_seconds(self.task3_last_goal_publish_time)
+            < self.task3_goal_republish_period
+        ):
+            return
+        self.task3_last_goal_publish_time = now
+        self._publish_goal(self.task3_door_pose)
+
+    def _task3_locate_drive_action(self):
+        corridor_action = self._task3_drivable_corridor_action()
+        if corridor_action is not None:
+            return corridor_action
+
+        road = self._segmentation_segment("road")
+        if road is not None and self.task3_use_drivable_corridor:
+            return self._drivable_follow_action_from_segment(
+                road,
+                prefer_bridge=False,
+                forward_action="FORWARD_SLOW",
+                hard_turn_tolerance=self.task3_corridor_hard_tolerance_pixels,
+            )
+        return self._action_toward_pose(self.task3_door_pose)
+
+    def _task3_drivable_corridor_action(self):
+        if not self.task3_use_drivable_corridor:
+            return None
+        if self.drivable_corridor_info is None or self.drivable_corridor_stamp is None:
+            return None
+        if self._elapsed_seconds(self.drivable_corridor_stamp) > self.task3_drivable_corridor_timeout:
+            return None
+
+        corridor = self.drivable_corridor_info
+        if (
+            not corridor.get("valid", False)
+            or not corridor.get("bottom_connected", False)
+            or corridor.get("side_view_likely", False)
+        ):
+            return self._reacquire_drivable_action(None)
+
+        error = float(corridor.get("error_x", 0.0))
+        self._remember_drivable_direction(error)
+        if abs(error) > self.task3_corridor_hard_tolerance_pixels:
+            return (
+                "CLOCKWISE_ROTATION_SLOW"
+                if error > 0.0
+                else "COUNTERCLOCKWISE_ROTATION_SLOW"
+            )
+        if abs(error) > self.task3_corridor_soft_tolerance_pixels:
+            return "RIGHT_FRONT" if error > 0.0 else "LEFT_FRONT"
+        return "FORWARD_SLOW"
+
+    def _task3_target_visible(self):
+        return self._target_visible() and self._bbox_visible()
+
+    def _task3_target_center_error(self):
+        bbox = self.yolo_bbox or {}
+        image_width = float(bbox.get("image_width", 0.0))
+        if image_width <= 0.0:
+            image_width = self._segmentation_image_width()
+        center_x = float(bbox.get("center_x", 0.0))
+        if image_width <= 0.0 or center_x <= 0.0:
+            return float((self.yolo_target or {}).get("delta_x", 0.0))
+        return center_x - image_width * 0.5
+
+    def _reset_task3_visual_pid(self):
+        self.task3_visual_pid_integral = 0.0
+        self.task3_visual_pid_last_error = None
+        self.task3_visual_pid_last_time = None
+
+    def _task3_visual_pid_angular_z(self, error):
+        now = self.get_clock().now()
+        dt = 0.0
+        if self.task3_visual_pid_last_time is not None:
+            dt = max(
+                1e-3,
+                (now.nanoseconds - self.task3_visual_pid_last_time.nanoseconds) / 1e9,
+            )
+        derivative = 0.0
+        if self.task3_visual_pid_last_error is not None and dt > 0.0:
+            derivative = (error - self.task3_visual_pid_last_error) / dt
+        if dt > 0.0:
+            self.task3_visual_pid_integral += error * dt
+            limit = max(0.0, self.task3_visual_pid_integral_limit)
+            self.task3_visual_pid_integral = max(
+                -limit, min(limit, self.task3_visual_pid_integral)
+            )
+        self.task3_visual_pid_last_error = error
+        self.task3_visual_pid_last_time = now
+
+        command = (
+            self.task3_visual_pid_kp * error
+            + self.task3_visual_pid_ki * self.task3_visual_pid_integral
+            + self.task3_visual_pid_kd * derivative
+        )
+        limit = max(0.0, self.task3_visual_pid_max_angular_z)
+        command = max(-limit, min(limit, command))
+        return -command
+
+    def _task3_target_depth(self):
+        depth = self._task3_depth_at_target_bbox()
+        if depth > 0.0:
+            return depth
+        bbox = self.yolo_bbox or {}
+        depth = float(bbox.get("distance", 0.0))
+        if depth > 0.0:
+            return depth
+        return float((self.yolo_target or {}).get("distance", 0.0))
+
+    def _task3_depth_at_target_bbox(self):
+        if self.latest_depth_image is None or self.latest_depth_stamp is None:
+            return 0.0
+        if self._elapsed_seconds(self.latest_depth_stamp) > self.target_timeout:
+            return 0.0
+        if not self._bbox_visible():
+            return 0.0
+
+        image = self.latest_depth_image
+        if len(image.shape) == 3:
+            image = image[:, :, 0]
+        height, width = image.shape[:2]
+        u = int(round(float(self.yolo_bbox.get("center_x", 0.0))))
+        v = int(round(float(self.yolo_bbox.get("center_y", 0.0))))
+        if u < 0 or v < 0 or u >= width or v >= height:
+            return 0.0
+
+        radius = max(0, int(self.task3_depth_patch_radius))
+        x1 = max(0, u - radius)
+        x2 = min(width, u + radius + 1)
+        y1 = max(0, v - radius)
+        y2 = min(height, v + radius + 1)
+        patch = image[y1:y2, x1:x2]
+        if np is None:
+            values = [float(value) for row in patch for value in row if float(value) > 0.0]
+            if not values:
+                return 0.0
+            value = sorted(values)[len(values) // 2]
+        else:
+            values = patch.astype(np.float32).reshape(-1)
+            values = values[values > 0.0]
+            if values.size == 0:
+                return 0.0
+            value = float(np.median(values))
+        return value / 1000.0 if value > 20.0 else value
+
+    def _task3_update_knob_arm_point(self):
+        camera_point = self._task3_knob_camera_point()
+        if camera_point is None:
+            self.get_logger().warn("Task 3: cannot compute knob camera point yet.")
+            return None
+        map_point = self._transform_point_stamped(camera_point, self.map_frame)
+        if map_point is None:
+            self.get_logger().warn("Task 3: cannot transform knob camera point to map.")
+            return None
+        arm_point = self._transform_point_stamped(map_point, self.task3_arm_base_frame)
+        if arm_point is None:
+            self.get_logger().warn("Task 3: cannot transform knob map point to arm base.")
+            return None
+        self.task3_knob_camera_point = camera_point
+        self.task3_knob_map_point = map_point
+        self.task3_knob_arm_point = arm_point
+        self.task3_knob_arm_point_pub.publish(arm_point)
+        return arm_point
+
+    def _task3_knob_camera_point(self):
+        if not self._task3_target_visible():
+            return None
+        depth = self._task3_target_depth()
+        if depth <= 0.0:
+            return None
+        bbox = self.yolo_bbox or {}
+        u = float(bbox.get("center_x", 0.0))
+        v = float(bbox.get("center_y", 0.0))
+        if u <= 0.0 or v <= 0.0:
+            return None
+
+        fx, fy, cx, cy = self._task3_camera_intrinsics()
+        if fx <= 0.0 or fy <= 0.0:
+            return None
+
+        point = PointStamped()
+        point.header.frame_id = self.latest_depth_frame or self.camera_frame or self.task3_camera_frame
+        point.header.stamp = self.get_clock().now().to_msg()
+        point.point.x = (u - cx) * depth / fx
+        point.point.y = (v - cy) * depth / fy
+        point.point.z = depth
+        return point
+
+    def _task3_camera_intrinsics(self):
+        fx = float(self.task3_camera_fx)
+        fy = float(self.task3_camera_fy)
+        cx = float(self.task3_camera_cx)
+        cy = float(self.task3_camera_cy)
+        if fx > 0.0 and fy > 0.0:
+            return fx, fy, cx, cy
+
+        bbox = self.yolo_bbox or {}
+        image_width = float(bbox.get("image_width", 0.0))
+        image_height = float(bbox.get("image_height", 0.0))
+        if image_width > 0.0 and image_height > 0.0:
+            fallback_f = max(image_width, image_height)
+            return fallback_f, fallback_f, image_width * 0.5, image_height * 0.5
+        return fx, fy, cx, cy
+
+    def _transform_point_stamped(self, point, target_frame):
+        source_frame = getattr(point.header, "frame_id", "")
+        if not source_frame or not target_frame:
+            return None
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                rclpy.time.Time(),
+                timeout=Duration(nanoseconds=int(self.bridge_map_tf_timeout * 1e9)),
+            )
+        except Exception as exc:
+            self.bridge_last_tf_error = str(exc)
+            return None
+        if do_transform_point is not None:
+            try:
+                return do_transform_point(point, transform)
+            except Exception as exc:
+                self.bridge_last_tf_error = str(exc)
+                return None
+
+        transformed = PointStamped()
+        transformed.header.frame_id = target_frame
+        transformed.header.stamp = self.get_clock().now().to_msg()
+        x, y, z = self._apply_transform_xyz(
+            (point.point.x, point.point.y, point.point.z),
+            transform,
+        )
+        transformed.point.x = x
+        transformed.point.y = y
+        transformed.point.z = z
+        return transformed
+
+    def _task3_arm_positions_for_step(self, step_index, arm_point):
+        if step_index == 1:
+            return self._task3_adjust_above_knob_positions(
+                self.task3_arm_above_knob_positions, arm_point
+            )
+        if step_index == 2:
+            return self._task3_adjust_above_knob_positions(
+                self.task3_arm_press_knob_positions, arm_point
+            )
+        return self.task3_arm_fold_positions
+
+    def _task3_adjust_above_knob_positions(self, positions, arm_point):
+        adjusted = list(positions)
+        if arm_point is None or len(adjusted) < 2:
+            return adjusted
+        if not self.arm_positions_in_degrees:
+            return adjusted
+        lateral = float(arm_point.point.y)
+        height = float(arm_point.point.z)
+        adjusted[0] += max(-20.0, min(20.0, math.degrees(math.atan2(lateral, 0.25))))
+        adjusted[1] += max(-15.0, min(15.0, (0.25 - height) * 40.0))
+        return adjusted
+
+    def _task3_unlock_step_hold(self, step_index):
+        if not self.task3_unlock_step_hold_seconds:
+            return 0.8
+        index = min(step_index, len(self.task3_unlock_step_hold_seconds) - 1)
+        return max(0.0, float(self.task3_unlock_step_hold_seconds[index]))
+
     def _task2_navigate_bridge(self):
         if self.task2_use_bridge_entry_pose:
             self._navigate_state(
@@ -3981,12 +4685,11 @@ class Task1MissionController(Node):
                 )
                 if bear_action is not None and bear_action != "STOP":
                     self.task2_turn_centered_frames = 0
-                    self._publish_action(bear_action)
+                    self._publish_task2_turn_action(bear_action)
                     return
 
             if abs(delta_x) <= self.task2_turn_visual_deadband_pixels:
                 self.task2_turn_centered_frames += 1
-                self._publish_action("STOP")
                 if (
                     self.task2_turn_centered_frames
                     >= self.task2_turn_center_confirm_frames
@@ -3998,8 +4701,12 @@ class Task1MissionController(Node):
                         self.get_logger().info(
                             "Task 2: bridge turn centered with fresh frames; approaching entry."
                         )
+                        self._publish_task2_turn_action(
+                            "STOP", allow_recovery=False
+                        )
                         self._reset_bridge_turn_controller()
                         self._set_state(MissionState.TASK2_APPROACH_BRIDGE_ENTRY)
+                        return
                     else:
                         frontal_ready, frontal_reason = (
                             self._task2_frontal_bridge_ready_for_ascent(
@@ -4016,12 +4723,19 @@ class Task1MissionController(Node):
                                 "task2_frontal_bridge_ascent_bypass",
                                 reason=frontal_reason,
                             )
+                            self._publish_task2_turn_action(
+                                "STOP", allow_recovery=False
+                            )
                             self._reset_bridge_turn_controller()
                             self._set_state(MissionState.TASK2_ASCEND_BRIDGE)
+                            return
+                self._publish_task2_turn_action(
+                    "STOP", reason="bridge centered but entry/ascent is not ready"
+                )
                 return
             self.task2_turn_centered_frames = 0
             action = self._task2_turn_pulse_action(delta_x)
-            self._publish_action(action)
+            self._publish_task2_turn_action(action)
             return
 
         if bridge is not None and delta_x is not None:
@@ -4030,24 +4744,28 @@ class Task1MissionController(Node):
                 and self._elapsed_seconds(self.task2_turn_state_start_time)
                 <= self.task2_turn_max_cached_control_seconds
             ):
-                self._publish_action(self._turn_action_from_error(delta_x))
+                self._publish_task2_turn_action(self._turn_action_from_error(delta_x))
                 return
-            self._publish_action("STOP")
+            self._publish_task2_turn_action(
+                "STOP", reason="cached bridge control expired"
+            )
             return
 
         bearing_error = self._bridge_landmark_bearing_error()
         if bearing_error is not None:
             if isinstance(bearing_error, float) and abs(bearing_error) <= self.task2_turn_map_yaw_tolerance:
-                self._publish_action("STOP")
+                self._publish_task2_turn_action(
+                    "STOP", reason="bridge landmark yaw is aligned"
+                )
                 return
             if abs(bearing_error) == 1.0:
-                self._publish_action(
+                self._publish_task2_turn_action(
                     "CLOCKWISE_ROTATION_SLOW"
                     if bearing_error > 0.0
                     else "COUNTERCLOCKWISE_ROTATION_SLOW"
                 )
             else:
-                self._publish_action(
+                self._publish_task2_turn_action(
                     "COUNTERCLOCKWISE_ROTATION_SLOW"
                     if bearing_error > 0.0
                     else "CLOCKWISE_ROTATION_SLOW"
@@ -4059,7 +4777,9 @@ class Task1MissionController(Node):
             and self._elapsed_seconds(self.task2_turn_state_start_time)
             < self.task2_bridge_tracking_expire
         ):
-            self._publish_action("STOP")
+            self._publish_task2_turn_action(
+                "STOP", reason="waiting inside bridge tracking grace period"
+            )
             return
 
         self.get_logger().warn(
@@ -4067,6 +4787,54 @@ class Task1MissionController(Node):
         )
         self._reset_bridge_turn_controller()
         self._set_state(MissionState.TASK2_SEARCH_BRIDGE)
+
+    def _publish_task2_turn_action(self, action_key, reason="", allow_recovery=True):
+        if action_key != "STOP":
+            self.task2_turn_stop_start_time = None
+            self.task2_turn_last_stop_reason = ""
+            self._publish_action(action_key)
+            return False
+
+        now = self.get_clock().now()
+        if self.task2_turn_stop_start_time is None:
+            self.task2_turn_stop_start_time = now
+            self.task2_turn_last_stop_reason = reason
+        elif reason:
+            self.task2_turn_last_stop_reason = reason
+
+        self._publish_action("STOP")
+
+        if not allow_recovery or not self.task2_turn_stop_recovery_enabled:
+            return False
+        if self.task2_turn_state_start_time is None:
+            return False
+        if (
+            self._elapsed_seconds(self.task2_turn_state_start_time)
+            < self.task2_turn_stop_recovery_min_state_seconds
+        ):
+            return False
+
+        stop_seconds = self._elapsed_seconds(self.task2_turn_stop_start_time)
+        if stop_seconds < self.task2_turn_stop_recovery_seconds:
+            return False
+
+        recovery_reason = reason or self.task2_turn_last_stop_reason
+        self.get_logger().warn(
+            "Task 2: turn-to-bridge held STOP for "
+            f"{stop_seconds:.1f}s; entering side-view recovery."
+        )
+        self._log_event(
+            "warn",
+            "task2_turn_stop_recovery",
+            reason=recovery_reason,
+            stop_seconds=stop_seconds,
+        )
+        self._reset_bridge_turn_controller()
+        self._set_state(
+            MissionState.TASK2_SIDE_VIEW_RECOVERY,
+            reason="turn-to-bridge consecutive STOP timeout",
+        )
+        return True
 
     def _task2_side_view_recovery(self):
         if self.task2_side_view_recovery_start_time is None:
@@ -4182,6 +4950,8 @@ class Task1MissionController(Node):
         self.task2_turn_error_before_pulse = None
         self.task2_turn_command_action = None
         self.task2_turn_centered_frames = 0
+        self.task2_turn_stop_start_time = None
+        self.task2_turn_last_stop_reason = ""
 
     def _task2_approach_bridge_entry(self):
         if self.task2_phase_start_time is None:
@@ -6157,6 +6927,15 @@ class Task1MissionController(Node):
     def _segmentation_guard_action(self, action_key):
         return action_key
 
+    def _state_is_task3(self, state=None):
+        state = self.state if state is None else state
+        return state in (
+            MissionState.TASK3_LOCATE_DOOR,
+            MissionState.TASK3_OBSERVE_AND_ALIGN,
+            MissionState.TASK3_UNLOCK_DOOR,
+            MissionState.TASK3_CLEAR_DOOR,
+        )
+
     def _state_uses_drivable_guard(self):
         return self.state in (
             MissionState.EXPLORE_MAP,
@@ -6168,6 +6947,7 @@ class Task1MissionController(Node):
             MissionState.TASK2_ASCEND_BRIDGE,
             MissionState.TASK2_SEARCH_BRIDGE_BEAR,
             MissionState.TASK2_DESCEND_BRIDGE,
+            MissionState.TASK3_LOCATE_DOOR,
         )
 
     def _preferred_drivable_segment(self, prefer_bridge=False):
@@ -6794,6 +7574,10 @@ class Task1MissionController(Node):
             MissionState.VERIFY_GRAB,
             MissionState.RETURN_START,
             MissionState.DROP_BEAR,
+            MissionState.TASK3_LOCATE_DOOR,
+            MissionState.TASK3_OBSERVE_AND_ALIGN,
+            MissionState.TASK3_UNLOCK_DOOR,
+            MissionState.TASK3_CLEAR_DOOR,
         ):
             self.startup_arm_stow_publish_sent = self.startup_arm_stow_publish_count
             return
@@ -8188,6 +8972,16 @@ class Task1MissionController(Node):
             self.last_action_log_time = now
             self._log_action(action_key)
 
+    def _publish_cmd_vel(self, linear_x, angular_z):
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.linear.y = 0.0
+        msg.linear.z = 0.0
+        msg.angular.x = 0.0
+        msg.angular.y = 0.0
+        msg.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(msg)
+
     def _publish_arm_positions(self, positions):
         msg = JointTrajectoryPoint()
         if self.arm_positions_in_degrees:
@@ -8199,7 +8993,7 @@ class Task1MissionController(Node):
 
     def _publish_target_label(self):
         msg = String()
-        msg.data = self.target_label
+        msg.data = self.task3_target_label if self._state_is_task3() else self.target_label
         self.target_label_pub.publish(msg)
 
     def _publish_state(self):
@@ -8257,11 +9051,37 @@ class Task1MissionController(Node):
             self.task2_final_align_close_loss_start_time = None
         if state != MissionState.TASK2_ASCEND_BRIDGE:
             self.task2_ascent_stop_start_time = None
+        if self._state_is_task3(state):
+            self.current_task = 3
+            self.task3_phase_start_time = None
+        if state == MissionState.TASK3_LOCATE_DOOR:
+            self._reset_task3_runtime()
+        if state == MissionState.TASK3_OBSERVE_AND_ALIGN:
+            self.task3_observe_start_time = None
+            self._reset_task3_visual_pid()
+            self._clear_navigation()
+        if state == MissionState.TASK3_UNLOCK_DOOR:
+            self.task3_unlock_step_index = 0
+            self.task3_unlock_step_start_time = None
+            self.task3_knob_camera_point = None
+            self.task3_knob_map_point = None
+            self.task3_knob_arm_point = None
+            self._clear_navigation()
+        if state == MissionState.TASK3_CLEAR_DOOR:
+            self.task3_clear_start_time = None
+            self.task3_retract_sent = False
+            self._clear_navigation()
+        if old_state in (
+            MissionState.TASK3_OBSERVE_AND_ALIGN,
+            MissionState.TASK3_CLEAR_DOOR,
+        ) and not self._state_is_task3(state):
+            self._publish_cmd_vel(0.0, 0.0)
         self._publish_state()
         self._log_state_transition(old_state, self.state, reason=reason)
         self.get_logger().info(f"Mission state -> {self.state.value}")
         if self.state == MissionState.DONE:
-            self._log_mission_summary()
+            if not self._should_start_task3_from_done():
+                self._log_mission_summary()
 
 
 def main(args=None):
@@ -8273,6 +9093,7 @@ def main(args=None):
         pass
     finally:
         node._publish_action("STOP")
+        node._publish_cmd_vel(0.0, 0.0)
         node._log_mission_summary()
         node.destroy_node()
         rclpy.shutdown()

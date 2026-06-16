@@ -38,7 +38,7 @@ def _install_ros_stubs():
     sys.modules["tf2_ros"] = tf2_ros
 
     for package, names in {
-        "geometry_msgs.msg": ["Point", "PointStamped", "PoseStamped", "PoseWithCovarianceStamped"],
+        "geometry_msgs.msg": ["Point", "PointStamped", "PoseStamped", "PoseWithCovarianceStamped", "Twist"],
         "nav_msgs.msg": ["OccupancyGrid", "Path"],
         "sensor_msgs.msg": ["CameraInfo", "CompressedImage", "Image", "PointCloud2", "PointField"],
         "std_msgs.msg": ["Float32MultiArray", "String"],
@@ -271,6 +271,12 @@ def _bridge_node():
     node.task2_turn_frontal_bridge_center_tolerance_pixels = 65.0
     node.task2_turn_frontal_bridge_bear_tolerance_pixels = 70.0
     node.task2_turn_frontal_bridge_require_target = True
+    node.task2_turn_stop_recovery_enabled = True
+    node.task2_turn_stop_recovery_seconds = 1.2
+    node.task2_turn_stop_recovery_min_state_seconds = 1.0
+    node.task2_turn_state_start_time = None
+    node.task2_turn_stop_start_time = None
+    node.task2_turn_last_stop_reason = ""
     node.task2_target_bridge_min_overlap_ratio = 0.12
     node.task2_target_bridge_min_lower_overlap_ratio = 0.20
     node.target_timeout = 1.0
@@ -368,6 +374,8 @@ def _bridge_node():
         "_reset_task2_ascent_bear_pid",
         "_task2_frontal_bridge_base_ready_for_ascent",
         "_task2_frontal_bridge_ready_for_ascent",
+        "_publish_task2_turn_action",
+        "_reset_bridge_turn_controller",
         "_task2_ascend_bridge",
         "_start_task2_ascent_settle",
         "_publish_ascent_or_action",
@@ -601,6 +609,45 @@ def test_turn_sign_auto_flips_after_repeated_wrong_way_pulses():
 
     assert node.task2_turn_direction_sign == -1.0
     assert node.task2_turn_wrong_way_count == 0
+
+
+def test_turn_stop_watchdog_enters_side_view_recovery_after_timeout():
+    node = _bridge_node()
+    node.task2_turn_state_start_time = types.SimpleNamespace(nanoseconds=1)
+    node.task2_turn_stop_start_time = types.SimpleNamespace(nanoseconds=1)
+    node._elapsed_seconds = lambda start_time: 1.3
+    node.get_clock = lambda: DummyClock()
+    node.get_logger = lambda: DummyLogger()
+    node._set_state = lambda state, reason="": setattr(node, "next_state", state)
+    actions = []
+    node._publish_action = actions.append
+
+    recovered = Task1MissionController._publish_task2_turn_action(
+        node, "STOP", reason="bridge centered without entry"
+    )
+
+    assert recovered
+    assert actions == ["STOP"]
+    assert node.next_state == MissionState.TASK2_SIDE_VIEW_RECOVERY
+    assert node.task2_turn_stop_start_time is None
+
+
+def test_turn_non_stop_action_clears_stop_watchdog():
+    node = _bridge_node()
+    node.task2_turn_stop_start_time = types.SimpleNamespace(nanoseconds=1)
+    node.task2_turn_last_stop_reason = "waiting"
+    node.get_clock = lambda: DummyClock()
+    actions = []
+    node._publish_action = actions.append
+
+    recovered = Task1MissionController._publish_task2_turn_action(
+        node, "CLOCKWISE_ROTATION_SLOW"
+    )
+
+    assert not recovered
+    assert actions == ["CLOCKWISE_ROTATION_SLOW"]
+    assert node.task2_turn_stop_start_time is None
+    assert node.task2_turn_last_stop_reason == ""
 
 
 def test_bridge_entry_gate_samples_remain_free():
